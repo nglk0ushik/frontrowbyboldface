@@ -1,0 +1,2002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Frontrow by Boldface</title>
+<meta property="og:title" content="Frontrow by Boldface" />
+<meta property="og:description" content="Where your clients see the work, and trust the process." />
+<meta property="og:image" content="https://frontrowbyboldface.online/og-image.png" />
+<meta property="og:url" content="https://frontrowbyboldface.online" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://frontrowbyboldface.online/og-image.png" />
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+// =====================
+// MOBILE NAV
+// =====================
+function buildMobileNav() {
+  const nav = document.getElementById('mobile-nav');
+  if(!nav) return;
+  if(CU.role === 'admin') {
+    nav.innerHTML = `
+      <div class="mob-nav-item" id="mn-dashboard" onclick="go('dashboard')">Home</div>
+      <div class="mob-nav-item" id="mn-clients" onclick="go('clients')">Clients</div>
+      <div class="mob-nav-item" id="mn-drafts" onclick="go('drafts')">Drafts<span class="mob-nav-badge" id="mob-notif" style="display:none"></span></div>
+      <div class="mob-nav-item" id="mn-payments" onclick="go('payments')">Money</div>
+      <div class="mob-nav-item" onclick="doLogout()" style="color:var(--red)">Sign Out</div>
+    `;
+  } else {
+    nav.innerHTML = `
+      <div class="mob-nav-item" id="mn-client-home" onclick="go('client-home')">Home</div>
+      <div class="mob-nav-item" id="mn-client-payments" onclick="go('client-payments')">Payments</div>
+      <div class="mob-nav-item" id="mn-client-drafts" onclick="go('client-drafts')">Drafts</div>
+      <div class="mob-nav-item" onclick="doLogout()" style="color:var(--red)">Sign Out</div>
+    `;
+  }
+}
+
+function setMobileNav(page) {
+  document.querySelectorAll('.mob-nav-item').forEach(el => el.classList.remove('active'));
+  const el = document.getElementById('mn-' + page);
+  if(el) el.classList.add('active');
+}
+
+// =====================
+// THREAD (COMMENTS)
+// =====================
+async function loadThread(postId) {
+  const { data } = await db.from('threads').select('*').eq('post_id', postId).order('created_at', {ascending:true});
+  return data || [];
+}
+
+function renderThread(messages, postId, isAdmin) {
+  const isEmpty = messages.length === 0;
+  const msgsHtml = isEmpty ? '<div class="thread-empty">No messages yet. Start the conversation.</div>' :
+    messages.map(m => {
+      const fromAdmin = m.sender === 'admin';
+      const cls = fromAdmin ? 'from-admin' : 'from-client';
+      const who = fromAdmin ? 'Koushik' : m.sender_name || 'Client';
+      return `<div class="thread-msg ${cls}">
+        <div class="thread-who">${who}</div>
+        <div class="thread-bubble">${escHtml(m.message)}</div>
+        <div class="thread-time">${fmtDateTime(m.created_at)}</div>
+      </div>`;
+    }).join('');
+
+  return `
+    <div style="margin-top:14px">
+      <div class="section-label">Conversation</div>
+      <div class="thread-container" id="thread-${postId}">${msgsHtml}</div>
+      <div class="thread-input-row">
+        <textarea id="thread-input-${postId}" placeholder="Type a message..." rows="1"></textarea>
+        <button class="btn btn-primary btn-sm" onclick="sendThreadMessage('${postId}','${isAdmin?'admin':'client'}')">Send</button>
+      </div>
+    </div>`;
+}
+
+async function sendThreadMessage(postId, senderRole) {
+  const input = document.getElementById('thread-input-' + postId);
+  const message = (input ? input.value : '').trim();
+  if(!message) return;
+
+  const senderName = CU.name;
+  const { error } = await db.from('threads').insert([{
+    post_id: postId,
+    sender: senderRole,
+    sender_name: senderName,
+    message
+  }]);
+
+  if(error) { toast('Error sending message.', 'error'); return; }
+
+  // Mark unread for the other side
+  if(senderRole === 'client') {
+    await db.from('posts').update({ comment_unread: true, comment_at: new Date().toISOString() }).eq('id', postId);
+  } else {
+    await db.from('posts').update({ admin_replied: true }).eq('id', postId);
+  }
+
+  if(input) input.value = '';
+  // Reload thread messages
+  const messages = await loadThread(postId);
+  const container = document.getElementById('thread-' + postId);
+  if(container) {
+    container.innerHTML = messages.map(m => {
+      const fromAdmin = m.sender === 'admin';
+      const cls = fromAdmin ? 'from-admin' : 'from-client';
+      const who = fromAdmin ? 'Koushik' : m.sender_name || 'Client';
+      return `<div class="thread-msg ${cls}">
+        <div class="thread-who">${who}</div>
+        <div class="thread-bubble">${escHtml(m.message)}</div>
+        <div class="thread-time">${fmtDateTime(m.created_at)}</div>
+      </div>`;
+    }).join('');
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+// =====================
+// APPROVAL (CLIENT)
+// =====================
+async function approvePost(postId) {
+  const { error } = await db.from('posts').update({
+    client_approved: true,
+    approved_at: new Date().toISOString()
+  }).eq('id', postId);
+  if(error) { toast('Error.', 'error'); return; }
+  toast('Draft approved!', 'success');
+  go('client-drafts');
+}
+
+// =====================
+// SEARCH (ADMIN)
+// =====================
+async function renderSearch() {
+  document.getElementById('pg-content').innerHTML = `
+    <input type="text" class="search-bar" id="search-input" placeholder="Search clients, drafts, payments..." oninput="doSearch()" autofocus/>
+    <div id="search-results"></div>
+  `;
+}
+
+async function doSearch() {
+  const q = (document.getElementById('search-input').value || '').trim().toLowerCase();
+  const results = document.getElementById('search-results');
+  if(!q || q.length < 2) { results.innerHTML = '<div class="meta" style="text-align:center;padding:20px">Type to search...</div>'; return; }
+
+  const [{ data: cl }, { data: po }, { data: pm }] = await Promise.all([
+    db.from('clients').select('*'),
+    db.from('posts').select('*, clients(name)'),
+    db.from('payments').select('*, clients(name)')
+  ]);
+
+  const clients = (cl||[]).filter(c =>
+    (c.name||'').toLowerCase().includes(q) ||
+    (c.company||'').toLowerCase().includes(q) ||
+    (c.email||'').toLowerCase().includes(q)
+  );
+
+  const posts = (po||[]).filter(p =>
+    (p.title||'').toLowerCase().includes(q) ||
+    (p.content||'').toLowerCase().includes(q) ||
+    (p.month_year||'').toLowerCase().includes(q)
+  );
+
+  const payments = (pm||[]).filter(p =>
+    (p.notes||'').toLowerCase().includes(q) ||
+    (p.clients&&(p.clients.name||'').toLowerCase().includes(q))
+  );
+
+  if(!clients.length && !posts.length && !payments.length) {
+    results.innerHTML = '<div class="meta" style="text-align:center;padding:20px">No results found.</div>';
+    return;
+  }
+
+  let html = '';
+
+  if(clients.length) {
+    html += clients.map(c => `
+      <div class="search-result" onclick="go('clients')">
+        <div class="search-result-type">Client</div>
+        <div class="search-result-title">${c.name}</div>
+        <div class="search-result-sub">${c.company||''} ${c.package_name?'· '+c.package_name:''}</div>
+      </div>`).join('');
+  }
+
+  if(posts.length) {
+    html += posts.map(p => `
+      <div class="search-result" onclick="go('drafts')">
+        <div class="search-result-type">Draft · ${p.clients?p.clients.name:'—'}</div>
+        <div class="search-result-title">${p.title||'Untitled'}</div>
+        <div class="search-result-sub">${(p.content||'').substring(0,80)}...</div>
+      </div>`).join('');
+  }
+
+  if(payments.length) {
+    html += payments.map(p => `
+      <div class="search-result" onclick="go('payments')">
+        <div class="search-result-type">Payment · ${p.clients?p.clients.name:'—'}</div>
+        <div class="search-result-title">&#8377;${Number(p.amount||0).toLocaleString()} · ${fmtDate(p.due_date)}</div>
+        <div class="search-result-sub">${p.notes||''} · ${p.status}</div>
+      </div>`).join('');
+  }
+
+  results.innerHTML = html;
+}
+
+// =====================
+// CASHFLOW (ADMIN)
+// =====================
+async function renderCashflow() {
+  const { data: pm } = await db.from('payments').select('*, clients(name)').order('due_date');
+  const payments = pm || [];
+
+  // Group by month
+  const months = {};
+  payments.forEach(p => {
+    if(!p.due_date) return;
+    const d = new Date(p.due_date);
+    const key = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+    const label = d.toLocaleDateString('en-IN', {month:'long', year:'numeric'});
+    if(!months[key]) months[key] = { label, received: [], pending: [], key };
+    if(p.status === 'received') months[key].received.push(p);
+    else months[key].pending.push(p);
+  });
+
+  const sortedKeys = Object.keys(months).sort();
+  const totalExpected = payments.reduce((s,p)=>s+(p.amount||0),0);
+
+  document.getElementById('pg-title').textContent = 'Cashflow';
+  document.getElementById('pg-sub').textContent = 'Month-wise breakdown of income';
+
+  document.getElementById('pg-content').innerHTML = `
+    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">
+      <div class="stat-card">
+        <div class="stat-label">Total Expected</div>
+        <div class="stat-value">&#8377;${Math.round(totalExpected/1000)}k</div>
+        <div class="stat-meta">Across all months</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Received So Far</div>
+        <div class="stat-value">&#8377;${Math.round(payments.filter(p=>p.status==='received').reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div>
+        <div class="stat-meta">${payments.filter(p=>p.status==='received').length} payments</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Still Incoming</div>
+        <div class="stat-value">&#8377;${Math.round(payments.filter(p=>p.status==='pending').reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div>
+        <div class="stat-meta">${payments.filter(p=>p.status==='pending').length} pending</div>
+      </div>
+    </div>
+    ${sortedKeys.map(k => {
+      const m = months[k];
+      const receivedTotal = m.received.reduce((s,p)=>s+(p.amount||0),0);
+      const pendingTotal = m.pending.reduce((s,p)=>s+(p.amount||0),0);
+      const monthTotal = receivedTotal + pendingTotal;
+      const pct = monthTotal > 0 ? Math.round((receivedTotal/monthTotal)*100) : 0;
+      const isPast = new Date(k+'-28') < new Date();
+      return `
+      <div class="cashflow-month">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div class="cashflow-month-title">${m.label}</div>
+          <div style="font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--gold)">&#8377;${Number(monthTotal).toLocaleString()}</div>
+        </div>
+        <div class="cashflow-bar"><div class="cashflow-bar-fill" style="width:${pct}%"></div></div>
+        <div style="display:flex;justify-content:space-between;margin-top:8px">
+          <div class="meta" style="color:var(--green-light)">&#10003; &#8377;${Number(receivedTotal).toLocaleString()} received</div>
+          <div class="meta" style="${pendingTotal>0?'color:var(--gold)':'color:var(--gray)'}">&#8377;${Number(pendingTotal).toLocaleString()} ${isPast&&pendingTotal>0?'overdue':'expected'}</div>
+        </div>
+        ${m.received.length+m.pending.length > 0 ? `
+        <div style="margin-top:10px;border-top:1px solid #1a1a1a;padding-top:10px">
+          ${[...m.received,...m.pending].map(p=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #141414">
+            <div style="font-size:13px">${p.clients?p.clients.name:'Past client'} <span class="meta">· ${p.notes||''}</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:13px">&#8377;${Number(p.amount||0).toLocaleString()}</span>
+              <span class="badge badge-${p.status==='received'?'paid':'pending'}">${p.status}</span>
+              ${p.status==='pending'?`<button class="btn btn-primary btn-sm" onclick="markPaid('${p.id}')">Mark Received</button>`:''}
+            </div>
+          </div>`).join('')}
+        </div>` : ''}
+      </div>`;
+    }).join('')}
+  `;
+}
+
+// =====================
+// CONTRACT RENEWAL ALERTS
+// =====================
+function checkRenewals(clients) {
+  const now = new Date();
+  const in30 = new Date(now.getTime() + 30 * 86400000);
+  return (clients||[]).filter(c => {
+    if(!c.contract_end) return false;
+    const end = new Date(c.contract_end);
+    return end >= now && end <= in30;
+  });
+}
+
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root{--black:#0a0a0a;--gold:#b8942e;--gold-light:#d4af5a;--cream:#f5f0e8;--white:#ffffff;--gray:#6b6b6b;--red:#c0392b;--green:#1a7a4a;--green-light:#4dab7a;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'DM Sans',sans-serif;background:var(--black);color:var(--cream);min-height:100vh;}
+
+/* CURTAIN */
+#curtain{position:fixed;inset:0;z-index:9999;background:var(--black);display:flex;align-items:center;justify-content:center;animation:curtainLift 0.7s ease-in-out 3.2s forwards;}
+@keyframes curtainLift{0%{transform:translateY(0);}100%{transform:translateY(-100%);}}
+.curtain-logo{text-align:center;}
+.curtain-front{font-family:'Cormorant Garamond',serif;font-size:min(64px,12vw);font-weight:600;letter-spacing:min(8px,1.5vw);color:var(--white);opacity:0;display:inline;animation:fadeInUp 0.7s ease forwards 0.3s;}
+.curtain-row{font-family:'Cormorant Garamond',serif;font-size:min(64px,12vw);font-weight:600;letter-spacing:min(8px,1.5vw);color:var(--gold);opacity:0;display:inline;animation:fadeInUp 0.7s ease forwards 0.7s;}
+.curtain-by{font-size:clamp(9px,2.5vw,11px);letter-spacing:clamp(2px,1vw,4px);text-transform:uppercase;color:var(--gray);opacity:0;margin-top:12px;animation:fadeInUp 0.6s ease forwards 1.2s;}
+.curtain-line{width:0;height:1px;background:linear-gradient(90deg,transparent,var(--gold),transparent);animation:lineGrow 0.9s ease forwards 1.8s;margin-top:20px;max-width:80%;}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
+@keyframes lineGrow{from{width:0;}to{width:min(220px,60vw);}}
+
+/* LOGIN */
+#login-screen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--black);z-index:1000;padding:20px;}
+.login-card{width:100%;max-width:420px;padding:50px 40px;background:#111;border:1px solid #222;position:relative;}
+.login-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent);}
+.login-logo{text-align:center;margin-bottom:36px;}
+.login-logo .logo-main{font-family:'Cormorant Garamond',serif;font-size:48px;font-weight:600;letter-spacing:4px;display:block;line-height:1;}
+.login-logo .logo-main .front{color:var(--white);}
+.login-logo .logo-main .row{color:var(--gold);}
+.login-logo .logo-sub{font-size:11px;letter-spacing:3px;color:var(--gray);text-transform:uppercase;margin-top:8px;display:block;}
+.login-divider{width:40px;height:1px;background:var(--gold);margin:18px auto;opacity:0.4;}
+.fg{margin-bottom:18px;}
+.fg label{display:block;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);margin-bottom:7px;}
+.fg input{width:100%;background:#0a0a0a;border:1px solid #2a2a2a;color:var(--cream);padding:13px 15px;font-family:'DM Sans',sans-serif;font-size:14px;outline:none;transition:border-color 0.2s;-webkit-appearance:none;border-radius:0;}
+.fg input:focus{border-color:var(--gold);}
+.btn-login{width:100%;background:var(--gold);color:var(--black);border:none;padding:15px;font-family:'DM Sans',sans-serif;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:600;cursor:pointer;margin-top:8px;-webkit-appearance:none;border-radius:0;}
+.login-error{color:var(--red);font-size:13px;text-align:center;margin-top:12px;min-height:18px;}
+
+/* APP LAYOUT */
+#app{display:none;min-height:100vh;}
+
+/* DESKTOP SIDEBAR */
+.sidebar{width:240px;background:#0d0d0d;border-right:1px solid #1a1a1a;position:fixed;top:0;left:0;bottom:0;display:flex;flex-direction:column;z-index:100;}
+.sidebar-logo{padding:24px 22px 20px;border-bottom:1px solid #1a1a1a;}
+.sl-front{font-family:'Cormorant Garamond',serif;font-size:24px;font-weight:600;color:var(--white);letter-spacing:2px;}
+.sl-row{font-family:'Cormorant Garamond',serif;font-size:24px;font-weight:600;color:var(--gold);letter-spacing:2px;}
+.sl-by{font-size:10px;letter-spacing:2px;color:var(--gray);text-transform:uppercase;margin-top:2px;}
+.sidebar-user{padding:12px 22px;border-bottom:1px solid #1a1a1a;font-size:12px;color:var(--gray);}
+.sidebar-user span{color:var(--gold);font-weight:500;}
+.sidebar-nav{flex:1;padding:14px 0;overflow-y:auto;}
+.nav-section{padding:12px 22px 4px;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:#333;}
+.nav-item{display:flex;align-items:center;gap:10px;padding:11px 22px;font-size:13px;color:var(--gray);cursor:pointer;transition:all 0.15s;border-left:2px solid transparent;}
+.nav-item:hover{color:var(--cream);background:#141414;}
+.nav-item.active{color:var(--gold);border-left-color:var(--gold);background:#141414;}
+.nav-badge{background:var(--red);color:white;font-size:9px;padding:2px 6px;border-radius:10px;margin-left:auto;}
+.sidebar-footer{padding:14px 22px;border-top:1px solid #1a1a1a;}
+.btn-logout{width:100%;background:transparent;border:1px solid #2a2a2a;color:var(--gray);padding:9px;font-size:11px;letter-spacing:2px;text-transform:uppercase;cursor:pointer;transition:all 0.2s;font-family:'DM Sans',sans-serif;}
+.btn-logout:hover{border-color:var(--red);color:var(--red);}
+
+/* MOBILE BOTTOM NAV */
+.mobile-header{display:none;position:fixed;top:0;left:0;right:0;z-index:100;background:#0d0d0d;border-bottom:1px solid #1a1a1a;padding:14px 18px;align-items:center;justify-content:space-between;}
+.mobile-logo{font-family:'Cormorant Garamond',serif;font-size:22px;font-weight:600;letter-spacing:2px;}
+.mobile-logo .mf{color:var(--white);}
+.mobile-logo .mr{color:var(--gold);}
+.mobile-user{font-size:11px;color:var(--gray);}
+.mobile-nav{display:none;position:fixed;bottom:0;left:0;right:0;z-index:100;background:#0d0d0d;border-top:1px solid #1a1a1a;padding:8px 0 max(8px,env(safe-area-inset-bottom));}
+.mobile-nav-inner{display:flex;justify-content:space-around;align-items:center;}
+.mob-nav-item{display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 10px;color:var(--gray);cursor:pointer;font-size:10px;letter-spacing:1px;text-transform:uppercase;min-width:56px;position:relative;}
+.mob-nav-item.active{color:var(--gold);}
+.mob-nav-dot{width:4px;height:4px;border-radius:50%;background:var(--gold);position:absolute;top:4px;right:8px;display:none;}
+.mob-nav-item.has-notif .mob-nav-dot{display:block;}
+
+/* MAIN */
+.main-content{margin-left:240px;min-height:100vh;padding-top:0;}
+.top-bar{padding:20px 32px;border-bottom:1px solid #1a1a1a;display:flex;align-items:center;justify-content:space-between;}
+.page-title{font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:500;color:var(--cream);}
+.page-sub{font-size:12px;color:var(--gray);margin-top:2px;}
+.content{padding:24px 32px;}
+
+/* SEARCH BAR */
+.search-wrap{margin-bottom:20px;}
+.search-input{width:100%;background:#111;border:1px solid #1a1a1a;color:var(--cream);padding:12px 16px;font-family:'DM Sans',sans-serif;font-size:13px;outline:none;transition:border-color 0.15s;}
+.search-input:focus{border-color:var(--gold);}
+.search-results{margin-top:8px;}
+.search-result-item{background:#111;border:1px solid #1a1a1a;padding:14px 16px;margin-bottom:8px;cursor:pointer;transition:border-color 0.15s;}
+.search-result-item:hover{border-color:var(--gold);}
+.search-result-type{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);margin-bottom:4px;}
+.search-result-title{font-size:14px;color:var(--cream);}
+.search-result-sub{font-size:12px;color:var(--gray);margin-top:2px;}
+
+/* PANELS */
+.panel{background:#111;border:1px solid #1a1a1a;margin-bottom:18px;}
+.panel-header{padding:16px 20px;border-bottom:1px solid #1a1a1a;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.panel-title{font-family:'Cormorant Garamond',serif;font-size:18px;font-weight:500;}
+.panel-body{padding:20px;}
+
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;}
+.stat-card{background:#111;border:1px solid #1a1a1a;padding:18px;}
+.stat-label{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);margin-bottom:7px;}
+.stat-value{font-family:'Cormorant Garamond',serif;font-size:32px;font-weight:500;color:var(--gold);line-height:1;}
+.stat-meta{font-size:12px;color:var(--gray);margin-top:4px;}
+
+/* TABLE */
+.data-table{width:100%;border-collapse:collapse;}
+.data-table th{text-align:left;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);padding:10px 13px;border-bottom:1px solid #1a1a1a;background:#0d0d0d;font-weight:400;}
+.data-table td{padding:12px 13px;font-size:13px;color:var(--cream);border-bottom:1px solid #141414;vertical-align:middle;}
+.data-table tr:last-child td{border-bottom:none;}
+.data-table tr:hover td{background:#141414;}
+
+/* BADGES */
+.badge{display:inline-block;padding:3px 9px;font-size:10px;letter-spacing:1px;text-transform:uppercase;font-weight:500;}
+.badge-paid{background:rgba(26,122,74,0.15);color:var(--green-light);border:1px solid rgba(26,122,74,0.3);}
+.badge-pending{background:rgba(184,148,46,0.15);color:var(--gold);border:1px solid rgba(184,148,46,0.3);}
+.badge-draft{background:rgba(107,107,107,0.15);color:var(--gray);border:1px solid rgba(107,107,107,0.3);}
+.badge-approved{background:rgba(26,122,74,0.15);color:var(--green-light);border:1px solid rgba(26,122,74,0.3);}
+.badge-published{background:rgba(58,111,216,0.15);color:#7ea4f4;border:1px solid rgba(58,111,216,0.3);}
+.badge-posted{background:rgba(26,122,74,0.25);color:#4dab7a;border:1px solid rgba(26,122,74,0.5);}
+.badge-edited{background:rgba(184,148,46,0.15);color:var(--gold);border:1px solid rgba(184,148,46,0.3);}
+.badge-comment{background:rgba(58,111,216,0.15);color:#7ea4f4;border:1px solid rgba(58,111,216,0.3);}
+.badge-client-approved{background:rgba(26,122,74,0.2);color:#4dab7a;border:1px solid rgba(26,122,74,0.4);}
+
+/* BUTTONS */
+.btn{padding:9px 16px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;border:none;font-family:'DM Sans',sans-serif;font-weight:500;transition:all 0.15s;-webkit-appearance:none;border-radius:0;}
+.btn-primary{background:var(--gold);color:var(--black);}
+.btn-primary:hover{background:var(--gold-light);}
+.btn-outline{background:transparent;border:1px solid #2a2a2a;color:var(--gray);}
+.btn-outline:hover{border-color:var(--gold);color:var(--gold);}
+.btn-sm{padding:6px 11px;font-size:10px;}
+.btn-danger{background:transparent;border:1px solid rgba(192,57,43,0.3);color:var(--red);}
+.btn-danger:hover{background:rgba(192,57,43,0.1);}
+.btn-green{background:var(--green);color:white;}
+.btn-approve{background:rgba(26,122,74,0.2);border:1px solid rgba(26,122,74,0.4);color:var(--green-light);font-family:'DM Sans',sans-serif;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;cursor:pointer;transition:all 0.15s;-webkit-appearance:none;border-radius:0;}
+.btn-approve:hover{background:rgba(26,122,74,0.35);}
+.btn-approve.approved{background:rgba(26,122,74,0.25);color:#4dab7a;cursor:default;}
+
+/* FORMS */
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
+.form-row.single{grid-template-columns:1fr;}
+.form-row.triple{grid-template-columns:1fr 1fr 1fr;}
+.field label{display:block;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);margin-bottom:5px;}
+.field input,.field select,.field textarea{width:100%;background:#0a0a0a;border:1px solid #2a2a2a;color:var(--cream);padding:10px 11px;font-family:'DM Sans',sans-serif;font-size:13px;outline:none;transition:border-color 0.15s;-webkit-appearance:none;border-radius:0;}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--gold);}
+.field select option{background:#111;}
+.field textarea{resize:vertical;min-height:100px;line-height:1.6;}
+.field-note{font-size:11px;color:var(--gray);margin-top:4px;}
+
+/* MODAL */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:500;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto;}
+.modal-overlay.active{display:flex;}
+.modal{background:#111;border:1px solid #2a2a2a;width:100%;max-width:620px;margin:auto;}
+.modal-header{padding:20px 24px;border-bottom:1px solid #1a1a1a;display:flex;align-items:center;justify-content:space-between;}
+.modal-title{font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:500;}
+.modal-close{background:none;border:none;color:var(--gray);font-size:22px;cursor:pointer;line-height:1;padding:2px 6px;}
+.modal-body{padding:24px;}
+.modal-footer{padding:16px 24px;border-top:1px solid #1a1a1a;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;}
+
+/* DRAFT CARDS */
+.draft-card{background:#0d0d0d;border:1px solid #1a1a1a;padding:18px;margin-bottom:14px;transition:border-color 0.15s;}
+.draft-card.has-edit{border-color:rgba(184,148,46,0.4);}
+.draft-card.has-comment{border-color:rgba(58,111,216,0.4);}
+.draft-card.client-approved{border-color:rgba(26,122,74,0.4);}
+.draft-title{font-family:'Cormorant Garamond',serif;font-size:17px;font-weight:500;}
+.draft-meta{font-size:11px;color:var(--gray);margin-top:3px;}
+.draft-content{font-size:13px;color:var(--gray);line-height:1.7;white-space:pre-wrap;background:#0a0a0a;padding:13px;border:1px solid #1a1a1a;margin-bottom:12px;}
+
+/* THREAD */
+.thread-wrap{margin-top:14px;border:1px solid #1a1a1a;background:#0a0a0a;}
+.thread-header{padding:10px 14px;border-bottom:1px solid #1a1a1a;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);}
+.thread-messages{padding:12px 14px;max-height:220px;overflow-y:auto;}
+.thread-msg{margin-bottom:12px;}
+.thread-msg:last-child{margin-bottom:0;}
+.thread-msg-meta{font-size:10px;color:var(--gray);margin-bottom:3px;}
+.thread-msg-meta .sender-you{color:var(--gold);}
+.thread-msg-meta .sender-client{color:var(--green-light);}
+.thread-msg-text{font-size:13px;color:var(--cream);line-height:1.6;background:#111;padding:9px 12px;border-left:2px solid #2a2a2a;}
+.thread-msg.msg-you .thread-msg-text{border-left-color:var(--gold);}
+.thread-msg.msg-client .thread-msg-text{border-left-color:var(--green-light);}
+.thread-reply{padding:10px 14px;border-top:1px solid #1a1a1a;display:flex;gap:8px;}
+.thread-reply textarea{flex:1;background:#111;border:1px solid #2a2a2a;color:var(--cream);padding:8px 10px;font-family:'DM Sans',sans-serif;font-size:13px;outline:none;resize:none;height:38px;line-height:1.4;-webkit-appearance:none;border-radius:0;}
+.thread-reply textarea:focus{border-color:var(--gold);}
+
+/* TOGGLE */
+.toggle-group{display:flex;margin-bottom:12px;flex-wrap:wrap;gap:0;}
+.toggle-btn{padding:7px 14px;font-size:11px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;border:1px solid #2a2a2a;background:transparent;color:var(--gray);font-family:'DM Sans',sans-serif;transition:all 0.15s;}
+.toggle-btn.active{background:var(--gold);color:var(--black);border-color:var(--gold);}
+
+/* NOTICES */
+.edit-notice{background:rgba(184,148,46,0.08);border:1px solid rgba(184,148,46,0.25);padding:9px 13px;font-size:12px;color:var(--gold);margin-bottom:10px;}
+.approved-notice{background:rgba(26,122,74,0.08);border:1px solid rgba(26,122,74,0.25);padding:9px 13px;font-size:12px;color:var(--green-light);margin-bottom:10px;}
+.admin-note-box{background:rgba(107,107,107,0.06);border:1px solid #1e1e1e;padding:11px 13px;margin-top:10px;}
+
+/* CASHFLOW */
+.cashflow-table{width:100%;border-collapse:collapse;}
+.cashflow-table th{text-align:left;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);padding:10px 13px;border-bottom:1px solid #1a1a1a;background:#0d0d0d;font-weight:400;}
+.cashflow-table td{padding:11px 13px;font-size:13px;border-bottom:1px solid #141414;vertical-align:top;}
+.cashflow-table tr:last-child td{border-bottom:none;}
+.cashflow-month{font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:500;color:var(--cream);}
+.cashflow-clients{font-size:11px;color:var(--gray);margin-top:3px;line-height:1.6;}
+.cashflow-total{font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--gold);}
+.cashflow-received{font-size:12px;color:var(--green-light);}
+.cashflow-pending{font-size:12px;color:var(--gold);}
+
+/* RENEWAL ALERT */
+.renewal-alert{background:rgba(192,57,43,0.08);border:1px solid rgba(192,57,43,0.3);padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.renewal-alert-text{font-size:13px;color:var(--red);}
+.renewal-alert-text strong{color:var(--cream);}
+
+/* ACTIVITY LOG */
+.activity-item{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid #141414;}
+.activity-item:last-child{border-bottom:none;}
+.activity-dot{width:8px;height:8px;border-radius:50%;background:var(--gold);margin-top:5px;flex-shrink:0;}
+.activity-text{font-size:13px;color:var(--cream);line-height:1.5;}
+.activity-time{font-size:11px;color:var(--gray);margin-top:2px;}
+
+/* CLIENT PORTAL */
+.portal-hero{background:#111;border:1px solid #1a1a1a;padding:28px;margin-bottom:18px;position:relative;overflow:hidden;}
+.portal-hero::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);}
+.portal-greeting{font-family:'Cormorant Garamond',serif;font-size:28px;font-weight:400;}
+.portal-sub{font-size:13px;color:var(--gray);margin-top:4px;}
+
+/* CONTRACT PROGRESS */
+.contract-progress{background:#111;border:1px solid #1a1a1a;padding:20px;margin-bottom:18px;}
+.progress-months{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;}
+.progress-month{flex:1;min-width:60px;background:#0d0d0d;border:1px solid #1a1a1a;padding:8px;text-align:center;font-size:11px;color:var(--gray);}
+.progress-month.done{background:rgba(184,148,46,0.1);border-color:var(--gold);color:var(--gold);}
+.progress-month.current{background:rgba(184,148,46,0.2);border-color:var(--gold-light);color:var(--gold-light);}
+
+/* MISC */
+.divider{border:none;border-top:1px solid #1a1a1a;margin:16px 0;}
+.empty-state{text-align:center;padding:44px 26px;color:var(--gray);}
+.loading{text-align:center;padding:36px;color:var(--gray);font-size:13px;}
+.spinner{display:inline-block;width:18px;height:18px;border:2px solid #2a2a2a;border-top-color:var(--gold);border-radius:50%;animation:spin 0.8s linear infinite;margin-right:8px;vertical-align:middle;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.toast-container{position:fixed;bottom:80px;right:16px;z-index:9999;}
+.toast{background:#1a1a1a;border:1px solid #2a2a2a;border-left:3px solid var(--gold);padding:12px 15px;margin-top:8px;font-size:13px;color:var(--cream);max-width:280px;animation:slideIn 0.3s ease;}
+.toast.error{border-left-color:var(--red);}
+.toast.success{border-left-color:var(--green);}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0;}to{transform:translateX(0);opacity:1;}}
+::-webkit-scrollbar{width:4px;}
+::-webkit-scrollbar-track{background:#0a0a0a;}
+::-webkit-scrollbar-thumb{background:#2a2a2a;}
+
+/* CASHFLOW TABLE */
+.cashflow-table{width:100%;border-collapse:collapse;}
+.cashflow-table th{text-align:left;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);padding:12px 16px;border-bottom:1px solid #1a1a1a;background:#0d0d0d;font-weight:400;}
+.cashflow-table td{padding:14px 16px;border-bottom:1px solid #141414;vertical-align:middle;}
+.cashflow-table tr:last-child td{border-bottom:none;}
+.cashflow-table tr:hover td{background:#141414;}
+.cashflow-month{font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:500;color:var(--cream);}
+.cashflow-clients{font-size:12px;color:var(--gray);line-height:1.6;}
+.cashflow-received{font-family:'Cormorant Garamond',serif;font-size:16px;color:var(--green-light);}
+.cashflow-pending{font-family:'Cormorant Garamond',serif;font-size:16px;color:var(--gold);}
+.cashflow-total{font-family:'Cormorant Garamond',serif;font-size:16px;color:var(--cream);font-weight:500;}
+
+/* SEARCH */
+.search-wrap{position:relative;margin-bottom:20px;}
+.search-input{width:100%;background:#111;border:1px solid #2a2a2a;border-bottom:2px solid var(--gold);color:var(--cream);padding:16px 20px;font-family:'Cormorant Garamond',serif;font-size:22px;outline:none;letter-spacing:1px;}
+.search-input::placeholder{color:#333;}
+.search-input:focus{border-color:var(--gold);background:#141414;}
+.search-results{display:flex;flex-direction:column;gap:8px;}
+.search-result-item{background:#111;border:1px solid #1a1a1a;padding:16px 20px;cursor:pointer;transition:all 0.15s;display:flex;align-items:center;gap:16px;}
+.search-result-item:hover{border-color:var(--gold);background:#141414;}
+.search-result-type{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--gray);background:#1a1a1a;padding:3px 8px;white-space:nowrap;}
+.search-result-title{font-family:'Cormorant Garamond',serif;font-size:17px;font-weight:500;color:var(--cream);}
+.search-result-sub{font-size:12px;color:var(--gray);margin-top:2px;}
+.action-btns{display:flex;gap:6px;flex-wrap:wrap;}
+.gold{color:var(--gold);}
+.meta{font-size:12px;color:var(--gray);}
+.warn-box{background:rgba(192,57,43,0.08);border:1px solid rgba(192,57,43,0.25);padding:14px;margin-bottom:14px;font-size:13px;line-height:1.7;}
+.warn-box strong{color:var(--red);}
+.section-label{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);margin-bottom:8px;display:block;}
+
+/* MOBILE RESPONSIVE */
+@media(max-width:768px){
+  .sidebar{display:none;}
+  .mobile-header{display:flex;}
+  .mobile-nav{display:block;}
+  .main-content{margin-left:0;padding-top:56px;padding-bottom:70px;}
+  .top-bar{padding:14px 16px;}
+  .page-title{font-size:22px;}
+  .content{padding:14px 16px;}
+  .stats-grid{grid-template-columns:1fr 1fr;gap:10px;}
+  .stat-value{font-size:26px;}
+  .form-row{grid-template-columns:1fr;}
+  .form-row.triple{grid-template-columns:1fr;}
+  .modal-overlay{padding:10px;align-items:flex-start;}
+  .modal{max-width:100%;}
+  .data-table th,.data-table td{padding:9px 10px;font-size:12px;}
+  .panel-header{padding:13px 15px;}
+  .panel-body{padding:14px;}
+  .panel-title{font-size:16px;}
+  .action-btns{gap:4px;}
+  .btn{padding:8px 12px;font-size:10px;}
+  .btn-sm{padding:5px 9px;font-size:9px;}
+  .top-bar{display:none;}
+  .toast-container{bottom:80px;right:12px;left:12px;}
+  .toast{max-width:100%;}
+  .draft-card{padding:14px;}
+  .cashflow-table th,.cashflow-table td{padding:9px 10px;font-size:12px;}
+  .thread-messages{max-height:160px;}
+  .stats-grid.three-col{grid-template-columns:1fr;}
+  .portal-hero{padding:20px;}
+  .portal-greeting{font-size:24px;}
+  #ac-payment-rows > div{grid-template-columns:1fr 1fr!important;}
+  #ac-payment-rows > div > div:nth-child(3){grid-column:1/-1;}
+  #ac-payment-rows > div > div:last-child{grid-column:1/-1;}
+}
+@media(max-width:380px){
+  .stats-grid{grid-template-columns:1fr;}
+  .login-card{padding:36px 24px;}
+  /* curtain handled by min() */
+}
+</style>
+</head>
+<body>
+
+<!-- Curtain -->
+<div id="curtain">
+  <div class="curtain-logo">
+    <div><span class="curtain-front">FRONT</span><span class="curtain-row">ROW</span></div>
+    <div class="curtain-by">by Boldface</div>
+    <div class="curtain-line"></div>
+  </div>
+</div>
+
+<!-- Mobile Header -->
+<div id="mobile-header" style="display:none">
+  <div>
+    <div><span class="mob-logo-front">FRONT</span><span class="mob-logo-row">ROW</span></div>
+    <div class="mob-logo-sub">by Boldface</div>
+  </div>
+  <div class="mob-hi">Hi, <span id="mob-hi-name"></span></div>
+</div>
+
+<!-- Login -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">
+      <span class="logo-main"><span class="front">FRONT</span><span class="row">ROW</span></span>
+      <span class="logo-sub">by Boldface</span>
+    </div>
+    <div class="login-divider"></div>
+    <div class="fg"><label>Username</label><input type="text" id="lu" placeholder="Enter username" autocomplete="off" autocorrect="off" autocapitalize="none"/></div>
+    <div class="fg"><label>Password</label><input type="password" id="lp" placeholder="Enter password"/></div>
+    <button class="btn-login" onclick="doLogin()">Enter</button>
+    <div class="login-error" id="lerr"></div>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <!-- Desktop Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-logo">
+      <div><span class="sl-front">FRONT</span><span class="sl-row">ROW</span></div>
+      <div class="sl-by">by Boldface</div>
+    </div>
+    <div class="sidebar-user">Logged in as <span id="sb-name"></span></div>
+    <nav class="sidebar-nav" id="sb-nav"></nav>
+    <div class="sidebar-footer"><button class="btn-logout" onclick="doLogout()">Sign Out</button></div>
+  </div>
+
+  <!-- Mobile Header -->
+  <div class="mobile-header">
+    <div class="mobile-logo"><span class="mf">FRONT</span><span class="mr">ROW</span></div>
+    <div class="mobile-user">Hi, <span id="mb-name" style="color:var(--gold)"></span></div>
+  </div>
+
+  <!-- Mobile Bottom Nav -->
+  <div class="mobile-nav" id="mb-nav"></div>
+
+  <!-- Main -->
+  <div class="main-content">
+    <div class="top-bar">
+      <div style="display:flex;flex-direction:column;gap:2px">
+        <div class="page-title" id="pg-title">Dashboard</div>
+        <div class="page-sub" id="pg-sub"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:20px">
+        <div id="pg-actions"></div>
+        <div style="text-align:right;border-left:1px solid #1a1a1a;padding-left:20px">
+          <div id="clock-date" style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--gray)"></div>
+          <div id="clock-time" style="font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:500;color:var(--gold);letter-spacing:1px;line-height:1.2"></div>
+          <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:#333;margin-top:1px">IST</div>
+        </div>
+      </div>
+    </div>
+    <div class="content" id="pg-content"><div class="loading"><span class="spinner"></span>Loading...</div></div>
+  </div>
+</div>
+
+<div id="modals"></div>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+const SUPABASE_URL='https://rrxpbmzszdwqhoqfhsqf.supabase.co';
+const SUPABASE_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJyeHBibXpzemR3cWhvcWZoc3FmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYwMDAwMzMsImV4cCI6MjA5MTU3NjAzM30.MPbP-59X2hOALFDVG5cmoH3KGcDjk1VirgYKS_JIc4M';
+const {createClient}=supabase;
+const db=createClient(SUPABASE_URL,SUPABASE_KEY);
+let CU=null,CP=null;
+
+setTimeout(()=>{const c=document.getElementById('curtain');if(c)c.remove();},4400);
+
+function startClock(){
+  function tick(){
+    const ist=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));
+    const days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const de=document.getElementById('clock-date'),te=document.getElementById('clock-time');
+    if(de)de.textContent=days[ist.getDay()]+', '+String(ist.getDate()).padStart(2,'0')+' '+months[ist.getMonth()]+' '+ist.getFullYear();
+    if(te)te.textContent=String(ist.getHours()).padStart(2,'0')+':'+String(ist.getMinutes()).padStart(2,'0')+':'+String(ist.getSeconds()).padStart(2,'0');
+  }
+  tick();setInterval(tick,1000);
+}
+startClock();
+
+function localDate(){
+  const d=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+  const s=sessionStorage.getItem('fr_user');
+  if(s){CU=JSON.parse(s);showApp();}
+  document.getElementById('lp').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+});
+
+// AUTH
+async function doLogin(){
+  const u=document.getElementById('lu').value.trim().toLowerCase();
+  const p=document.getElementById('lp').value;
+  if(!u||!p){document.getElementById('lerr').textContent='Enter username and password.';return;}
+  const{data,error}=await db.from('users').select('*').eq('username',u).eq('password',p).limit(1);
+  if(error||!data||data.length===0){document.getElementById('lerr').textContent='Invalid username or password.';return;}
+  const user=data[0];
+  CU={username:user.username,role:user.role,name:user.name,clientId:user.client_id};
+  sessionStorage.setItem('fr_user',JSON.stringify(CU));
+  document.getElementById('lerr').textContent='';
+  showApp();
+}
+
+function doLogout(){
+  sessionStorage.removeItem('fr_user');CU=null;
+  document.getElementById('login-screen').style.display='flex';
+  document.getElementById('app').style.display='none';
+}
+
+function showApp(){
+  document.getElementById('login-screen').style.display='none';
+  document.getElementById('app').style.display='block';
+  document.getElementById('sb-name').textContent=CU.name;
+  document.getElementById('mb-name').textContent=CU.name;
+  buildNav();
+  go(CU.role==='admin'?'dashboard':'client-home');
+}
+
+// NAV
+function buildNav(){
+  const nav=document.getElementById('sb-nav');
+  const mbnav=document.getElementById('mb-nav');
+  if(CU.role==='admin'){
+    nav.innerHTML=`
+      <div class="nav-section">Overview</div>
+      <div class="nav-item" id="n-dashboard" onclick="go('dashboard')">Dashboard</div>
+      <div class="nav-section">Clients</div>
+      <div class="nav-item" id="n-clients" onclick="go('clients')">All Clients</div>
+      <div class="nav-item" id="n-payments" onclick="go('payments')">Payments</div>
+      <div class="nav-item" id="n-cashflow" onclick="go('cashflow')">Cashflow</div>
+      <div class="nav-section">Content</div>
+      <div class="nav-item" id="n-drafts" onclick="go('drafts')">Post Drafts <span class="nav-badge" id="notif-badge" style="display:none"></span></div>
+      <div class="nav-section">Manage</div>
+      <div class="nav-item" id="n-add-client" onclick="go('add-client')">Add Client</div>
+    `;
+    mbnav.innerHTML=`<div class="mobile-nav-inner">
+      <div class="mob-nav-item" id="mn-dashboard" onclick="go('dashboard')"><span>Home</span></div>
+      <div class="mob-nav-item" id="mn-clients" onclick="go('clients')"><span>Clients</span></div>
+      <div class="mob-nav-item" id="mn-cashflow" onclick="go('cashflow')"><span>Cashflow</span></div>
+      <div class="mob-nav-item" id="mn-drafts" onclick="go('drafts')"><span>Drafts</span><div class="mob-nav-dot" id="mob-notif-dot"></div></div>
+    </div>`;
+    refreshNotifBadge();
+  } else {
+    nav.innerHTML=`
+      <div class="nav-section">My Portal</div>
+      <div class="nav-item" id="n-client-home" onclick="go('client-home')">Overview</div>
+      <div class="nav-item" id="n-client-payments" onclick="go('client-payments')">Payments</div>
+      <div class="nav-item" id="n-client-drafts" onclick="go('client-drafts')">Post Drafts</div>
+    `;
+    mbnav.innerHTML=`<div class="mobile-nav-inner">
+      <div class="mob-nav-item" id="mn-client-home" onclick="go('client-home')"><span>Home</span></div>
+      <div class="mob-nav-item" id="mn-client-payments" onclick="go('client-payments')"><span>Payments</span></div>
+      <div class="mob-nav-item" id="mn-client-drafts" onclick="go('client-drafts')"><span>Drafts</span></div>
+      <div class="mob-nav-item" style="cursor:pointer" onclick="doLogout()"><span style="color:var(--red)">Logout</span></div>
+    </div>`;
+  }
+}
+
+async function refreshNotifBadge(){
+  const{data}=await db.from('posts').select('id,client_edited,comment_unread,client_approved');
+  const badge=document.getElementById('notif-badge');
+  const dot=document.getElementById('mob-notif-dot');
+  const posts=data||[];
+  const total=posts.filter(p=>p.client_edited||p.comment_unread||p.client_approved).length;
+  if(badge){if(total>0){badge.style.display='inline-block';badge.textContent=total;}else badge.style.display='none';}
+  if(dot)dot.style.display=total>0?'block':'none';
+}
+
+function setNav(id){
+  document.querySelectorAll('.nav-item,.mob-nav-item').forEach(el=>el.classList.remove('active'));
+  const el=document.getElementById('n-'+id)||document.getElementById('mn-'+id);
+  if(el)el.classList.add('active');
+  // mobile mirror
+  const mel=document.getElementById('mn-'+id);
+  if(mel)mel.classList.add('active');
+}
+
+// GO
+async function go(page){
+  CP=page;
+  document.getElementById('pg-content').innerHTML='<div class="loading"><span class="spinner"></span>Loading...</div>';
+  document.getElementById('pg-actions').innerHTML='';
+  const titles={
+    'dashboard':['Dashboard','Welcome back, '+CU.name],
+    'clients':['Clients','All active engagements'],
+    'payments':['Payments','Track all payment statuses'],
+    'cashflow':['Cashflow','Month-wise income view'],
+    'drafts':['Post Drafts','Manage drafts for all clients'],
+    'add-client':['Add Client','Onboard a new engagement'],
+    'cashflow':['Cashflow','Month-wise income breakdown'],
+    'client-home':['Overview','Your Boldface portal'],
+    'client-payments':['Payments','Your payment schedule'],
+    'client-drafts':['Post Drafts','Content drafted for you'],
+  };
+  const t=titles[page]||['Page',''];
+  document.getElementById('pg-title').textContent=t[0];
+  document.getElementById('pg-sub').textContent=t[1];
+  setNav(page);
+  if(CU.role==='admin'){
+    if(page==='dashboard')await renderAdminDash();
+    else if(page==='clients')await renderClients();
+    else if(page==='payments')await renderPayments();
+    else if(page==='cashflow')await renderCashflow();
+    else if(page==='drafts')await renderDrafts();
+    else if(page==='add-client')renderAddClient();
+  } else {
+    if(page==='client-home')await renderClientHome();
+    else if(page==='client-payments')await renderClientPayments();
+    else if(page==='client-drafts')await renderClientDrafts();
+  }
+}
+
+// ADMIN DASHBOARD
+async function renderAdminDash(){
+  const[{data:cl},{data:pm},{data:po}]=await Promise.all([
+    db.from('clients').select('*'),
+    db.from('payments').select('*'),
+    db.from('posts').select('*')
+  ]);
+  const clients=cl||[],payments=pm||[],posts=po||[];
+  const received=payments.filter(p=>p.status==='received');
+  const pending=payments.filter(p=>p.status==='pending');
+  const{data:allRec}=await db.from('payments').select('amount').eq('status','received');
+  const totalRev=(allRec||[]).reduce((s,p)=>s+(p.amount||0),0);
+  const notifPosts=posts.filter(p=>p.client_edited||p.comment_unread||p.client_approved);
+
+  // Renewal alerts — contracts ending within 30 days
+  const now=new Date();
+  const expiring=clients.filter(c=>{
+    if(!c.contract_end)return false;
+    const end=new Date(c.contract_end);
+    const days=Math.ceil((end-now)/86400000);
+    return days>=0&&days<=30;
+  });
+
+  let renewalHtml='';
+  if(expiring.length>0){
+    renewalHtml=expiring.map(c=>{
+      const days=Math.ceil((new Date(c.contract_end)-now)/86400000);
+      return`<div class="renewal-alert"><div class="renewal-alert-text"><strong>${c.name}</strong>'s contract expires in <strong style="color:var(--red)">${days} day${days!==1?'s':''}</strong> on ${fmtDate(c.contract_end)}. Time to start the renewal conversation.</div><button class="btn btn-outline btn-sm" onclick="go('clients')">View Client</button></div>`;
+    }).join('');
+  }
+
+  document.getElementById('pg-content').innerHTML=`
+    ${renewalHtml}
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">Active Clients</div><div class="stat-value">${clients.length}</div><div class="stat-meta">Engagements running</div></div>
+      <div class="stat-card"><div class="stat-label">Total Revenue</div><div class="stat-value">&#8377;${Math.round(totalRev/1000)}k</div><div class="stat-meta">${received.length} payments cleared</div></div>
+      <div class="stat-card"><div class="stat-label">Pending</div><div class="stat-value">&#8377;${Math.round(pending.reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div><div class="stat-meta">${pending.length} awaiting</div></div>
+      <div class="stat-card"><div class="stat-label">Notifications</div><div class="stat-value" style="${notifPosts.length>0?'color:var(--gold)':''}">${notifPosts.length}</div><div class="stat-meta">From clients</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title">Upcoming Payments</div><button class="btn btn-outline btn-sm" onclick="go('payments')">View All</button></div>
+      <div class="panel-body" style="padding:0">
+        ${pending.length===0?'<div class="empty-state"><p>No pending payments.</p></div>':'<table class="data-table"><thead><tr><th>Client</th><th>Amount</th><th>Due</th><th>Action</th></tr></thead><tbody>'+
+        pending.slice(0,5).map(p=>{const c=clients.find(x=>x.id===p.client_id);return`<tr><td>${c?c.name:'—'}</td><td class="gold">&#8377;${Number(p.amount||0).toLocaleString()}</td><td>${fmtDate(p.due_date)}</td><td><button class="btn btn-primary btn-sm" onclick="markPaid('${p.id}')">Mark Received</button></td></tr>`;}).join('')+'</tbody></table>'}
+      </div>
+    </div>
+    ${notifPosts.length>0?`
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title" style="color:var(--gold)">Client Activity</div><button class="btn btn-outline btn-sm" onclick="go('drafts')">Go to Drafts</button></div>
+      <div class="panel-body" style="padding:0">
+        <table class="data-table"><thead><tr><th>Client</th><th>Post</th><th>Activity</th><th>When</th></tr></thead><tbody>
+          ${notifPosts.map(p=>{const c=clients.find(x=>x.id===p.client_id);const act=p.client_approved?'Approved':p.client_edited?'Edited':'Comment';return`<tr><td>${c?c.name:'—'}</td><td>${p.title||'Untitled'}</td><td><span class="badge badge-${p.client_approved?'client-approved':p.client_edited?'edited':'comment'}">${act}</span></td><td class="meta">${fmtDateTime(p.approved_at||p.edited_at||p.comment_at)}</td></tr>`;}).join('')}
+        </tbody></table>
+      </div>
+    </div>`:''}
+  `;
+}
+
+// SEARCH
+function renderSearch(){
+  document.getElementById('pg-content').innerHTML=`
+    <div class="search-wrap">
+      <input class="search-input" id="search-input" placeholder="Search clients, drafts, payments..." oninput="doSearch(this.value)" autofocus/>
+    </div>
+    <div class="search-results" id="search-results"><div class="meta" style="text-align:center;padding:20px">Start typing to search...</div></div>
+  `;
+}
+
+let searchTimer=null;
+async function doSearch(q){
+  clearTimeout(searchTimer);
+  if(q.trim().length<2){document.getElementById('search-results').innerHTML='<div class="meta" style="text-align:center;padding:20px">Type at least 2 characters...</div>';return;}
+  searchTimer=setTimeout(async()=>{
+    const[{data:cl},{data:po},{data:pm}]=await Promise.all([
+      db.from('clients').select('*').ilike('name','%'+q+'%'),
+      db.from('posts').select('*,clients(name)').or('title.ilike.%'+q+'%,content.ilike.%'+q+'%'),
+      db.from('payments').select('*,clients(name)').ilike('notes','%'+q+'%')
+    ]);
+    const results=[];
+    (cl||[]).forEach(c=>results.push({type:'Client',title:c.name,sub:c.company||'',action:()=>go('clients')}));
+    (po||[]).forEach(p=>results.push({type:'Draft',title:p.title||'Untitled',sub:(p.clients?p.clients.name:'')+(p.month_year?' · '+p.month_year:''),action:()=>go('drafts')}));
+    (pm||[]).forEach(p=>results.push({type:'Payment',title:'&#8377;'+Number(p.amount||0).toLocaleString()+' — '+(p.clients?p.clients.name:''),sub:p.notes||'',action:()=>go('payments')}));
+    const el=document.getElementById('search-results');
+    if(!results.length){el.innerHTML='<div class="meta" style="text-align:center;padding:20px">No results found.</div>';return;}
+    el.innerHTML=results.map((r,i)=>`
+      <div class="search-result-item" onclick="searchResults[${i}].action()">
+        <div class="search-result-type">${r.type}</div>
+        <div>
+          <div class="search-result-title">${r.title}</div>
+          <div class="search-result-sub">${r.sub}</div>
+        </div>
+      </div>`).join('');
+    window.searchResults=results;
+  },300);
+}
+
+// CASHFLOW
+async function renderCashflow(){
+  const{data:pm}=await db.from('payments').select('*,clients(name)').order('due_date');
+  const payments=pm||[];
+  const monthMap={};
+  payments.forEach(p=>{
+    const d=new Date(p.due_date||p.created_at);
+    const key=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+    const label=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()]+' '+d.getFullYear();
+    if(!monthMap[key])monthMap[key]={label,received:0,pending:0,clients:[]};
+    if(p.status==='received')monthMap[key].received+=p.amount||0;
+    else monthMap[key].pending+=p.amount||0;
+    const name=p.clients?p.clients.name:'Unknown';
+    if(!monthMap[key].clients.includes(name))monthMap[key].clients.push(name);
+  });
+  const months=Object.keys(monthMap).sort();
+  const now=new Date();
+  const currentKey=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+  const{data:allRec}=await db.from('payments').select('amount').eq('status','received');
+  const totalRev=(allRec||[]).reduce((s,p)=>s+(p.amount||0),0);
+
+  document.getElementById('pg-content').innerHTML=`
+    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat-card"><div class="stat-label">All-Time Revenue</div><div class="stat-value">&#8377;${Math.round(totalRev/1000)}k</div><div class="stat-meta">Total received</div></div>
+      <div class="stat-card"><div class="stat-label">This Month</div><div class="stat-value">&#8377;${Math.round((monthMap[currentKey]?.received||0)/1000)}k</div><div class="stat-meta">Received in ${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][now.getMonth()]}</div></div>
+      <div class="stat-card"><div class="stat-label">Next 30 Days</div><div class="stat-value">&#8377;${Math.round(payments.filter(p=>{const d=new Date(p.due_date);return p.status==='pending'&&d>=now&&(d-now)/86400000<=30;}).reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div><div class="stat-meta">Expected incoming</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title">Month-wise Cashflow</div></div>
+      <div class="panel-body" style="padding:0">
+        <table class="cashflow-table">
+          <thead><tr><th>Month</th><th>Clients</th><th>Received</th><th>Pending</th><th>Total</th></tr></thead>
+          <tbody>
+            ${months.map(key=>{
+              const m=monthMap[key];
+              const isCurrent=key===currentKey;
+              const isFuture=key>currentKey;
+              return`<tr style="${isCurrent?'background:rgba(184,148,46,0.05)':''}">
+                <td><div class="cashflow-month">${m.label} ${isCurrent?'<span class="badge badge-edited" style="font-size:9px">Now</span>':''}</div></td>
+                <td><div class="cashflow-clients">${m.clients.join('<br>')}</div></td>
+                <td>${m.received>0?'<div class="cashflow-received">&#8377;'+Number(m.received).toLocaleString()+'</div>':'<div class="meta">—</div>'}</td>
+                <td>${m.pending>0?'<div class="cashflow-pending">&#8377;'+Number(m.pending).toLocaleString()+'</div>':'<div class="meta">—</div>'}</td>
+                <td><div class="cashflow-total">&#8377;${Number(m.received+m.pending).toLocaleString()}</div></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// CLIENTS
+async function renderClients(){
+  document.getElementById('pg-actions').innerHTML='<button class="btn btn-primary" onclick="go(\'add-client\')">+ Add Client</button>';
+  const{data:cl}=await db.from('clients').select('*').order('created_at',{ascending:false});
+  const{data:pm}=await db.from('payments').select('*');
+  const{data:po}=await db.from('posts').select('*');
+  const clients=cl||[],payments=pm||[],posts=po||[];
+  if(!clients.length){document.getElementById('pg-content').innerHTML='<div class="empty-state"><p>No clients yet.</p></div>';return;}
+
+  document.getElementById('pg-content').innerHTML=clients.map(c=>{
+    const cpm=payments.filter(p=>p.client_id===c.id);
+    const cpo=posts.filter(p=>p.client_id===c.id);
+    const paid=cpm.filter(p=>p.status==='received');
+    const pend=cpm.filter(p=>p.status==='pending');
+    const notifPosts=cpo.filter(p=>p.client_edited||p.comment_unread||p.client_approved);
+    const now=new Date();
+    const start=c.contract_start?new Date(c.contract_start):now;
+    const end=c.contract_end?new Date(c.contract_end):now;
+    const prog=Math.round((Math.min(Math.max(0,(now-start)/86400000),(end-start)/86400000)/Math.max(1,(end-start)/86400000))*100);
+    const daysLeft=Math.max(0,Math.ceil((end-now)/86400000));
+    const expiringSoon=daysLeft<=30;
+
+    // Activity log for client
+    const activities=[];
+    cpo.forEach(p=>{
+      if(p.client_approved)activities.push({text:`Approved "${p.title||'Untitled'}"`,time:p.approved_at});
+      if(p.client_edited)activities.push({text:`Edited "${p.title||'Untitled'}"`,time:p.edited_at});
+      if(p.comment_unread)activities.push({text:`Commented on "${p.title||'Untitled'}"`,time:p.comment_at});
+    });
+    activities.sort((a,b)=>new Date(b.time)-new Date(a.time));
+
+    return`
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">${c.name} ${notifPosts.length>0?'<span class="badge badge-edited" style="font-size:10px;margin-left:6px">'+notifPosts.length+' new</span>':''} ${expiringSoon?'<span class="badge badge-pending" style="font-size:10px;margin-left:6px">Expires in '+daysLeft+'d</span>':''}</div>
+          <div class="meta">${c.company||''} ${c.email?'· '+c.email:''}</div>
+        </div>
+        <div class="action-btns">
+          <button class="btn btn-outline btn-sm" onclick="openEditClient('${c.id}')">Edit</button>
+          <button class="btn btn-outline btn-sm" onclick="openAddPayment('${c.id}','${escAttr(c.name)}')">+ Payment</button>
+          <button class="btn btn-primary btn-sm" onclick="openAddDraft('${c.id}','${escAttr(c.name)}')">+ Draft</button>
+          <button class="btn btn-danger btn-sm" onclick="confirmDeleteClient('${c.id}','${escAttr(c.name)}')">Delete</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:18px">
+          <div><div class="stat-label">Package</div><div style="font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--gold)">&#8377;${Number(c.package_amount||0).toLocaleString()}<span style="font-size:12px;color:var(--gray)">/mo</span></div><div class="meta">${c.package_name||''}</div></div>
+          <div><div class="stat-label">Contract</div><div style="font-size:13px">${fmtDate(c.contract_start)} → ${fmtDate(c.contract_end)}</div><div style="background:#1a1a1a;height:3px;margin-top:5px"><div style="background:var(--gold);height:3px;width:${prog}%"></div></div><div class="meta" style="margin-top:3px">${prog}% elapsed</div></div>
+          <div><div class="stat-label">Payments</div><div style="font-size:13px;color:var(--green-light)">&#10003; ${paid.length} received</div><div style="font-size:13px;color:var(--gold)">${pend.length} pending</div></div>
+          <div><div class="stat-label">Deliverables</div><div style="font-size:12px;color:var(--gray);line-height:1.7">${c.notes||'—'}</div></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+          <div>
+            <span class="section-label">Payment Schedule</span>
+            ${cpm.length===0?'<div class="meta">No payments added.</div>':`
+            <table class="data-table" style="background:#0a0a0a">
+              <thead><tr><th>Amount</th><th>Due</th><th>Status</th><th></th></tr></thead>
+              <tbody>${cpm.map(p=>`<tr><td>&#8377;${Number(p.amount||0).toLocaleString()}</td><td>${fmtDate(p.due_date)}</td><td><span class="badge badge-${p.status==='received'?'paid':'pending'}">${p.status}</span></td><td>${p.status==='pending'?`<button class="btn btn-primary btn-sm" onclick="markPaid('${p.id}')">&#10003;</button>`:`<button class="btn btn-outline btn-sm" onclick="markUnpaid('${p.id}')">Undo</button>`}</td></tr>`).join('')}</tbody>
+            </table>`}
+          </div>
+          <div>
+            <span class="section-label">Activity Log</span>
+            ${activities.length===0?'<div class="meta">No activity yet.</div>':activities.slice(0,4).map(a=>`<div class="activity-item"><div class="activity-dot"></div><div><div class="activity-text">${a.text}</div><div class="activity-time">${fmtDateTime(a.time)}</div></div></div>`).join('')}
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// PAYMENTS
+async function renderPayments(){
+  const{data:pm}=await db.from('payments').select('*,clients(name)').order('due_date');
+  const payments=pm||[];
+  const received=payments.filter(p=>p.status==='received');
+  const pending=payments.filter(p=>p.status==='pending');
+  const{data:allRec}=await db.from('payments').select('amount').eq('status','received');
+  const totalRev=(allRec||[]).reduce((s,p)=>s+(p.amount||0),0);
+  document.getElementById('pg-content').innerHTML=`
+    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat-card"><div class="stat-label">All-Time Revenue</div><div class="stat-value">&#8377;${Math.round(totalRev/1000)}k</div><div class="stat-meta">Including past clients</div></div>
+      <div class="stat-card"><div class="stat-label">Total Pending</div><div class="stat-value">&#8377;${Math.round(pending.reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div><div class="stat-meta">${pending.length} payments</div></div>
+      <div class="stat-card"><div class="stat-label">Collection Rate</div><div class="stat-value">${payments.length?Math.round((received.length/payments.length)*100):0}%</div><div class="stat-meta">of active payments</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title">All Payments</div></div>
+      <div class="panel-body" style="padding:0;overflow-x:auto">
+        ${payments.length===0?'<div class="empty-state"><p>No payments yet.</p></div>':`
+        <table class="data-table">
+          <thead><tr><th>Client</th><th>Amount</th><th>Due</th><th>Received</th><th>Status</th><th>Notes</th><th>Action</th></tr></thead>
+          <tbody>${payments.map(p=>`<tr><td>${p.clients?p.clients.name:'(past client)'}</td><td class="gold">&#8377;${Number(p.amount||0).toLocaleString()}</td><td>${fmtDate(p.due_date)}</td><td>${p.received_date?fmtDate(p.received_date):'—'}</td><td><span class="badge badge-${p.status==='received'?'paid':'pending'}">${p.status}</span></td><td class="meta">${p.notes||'—'}</td><td style="display:flex;gap:5px;flex-wrap:wrap">${p.status==='pending'?`<button class="btn btn-primary btn-sm" onclick="markPaid('${p.id}')">Mark Received</button>`:`<span class="meta" style="margin-right:5px">&#10003;</span><button class="btn btn-outline btn-sm" onclick="markUnpaid('${p.id}')">Undo</button>`}<button class="btn btn-danger btn-sm" onclick="deletePayment('${p.id}')">Delete</button></td></tr>`).join('')}</tbody>
+        </table>`}
+      </div>
+    </div>
+  `;
+}
+
+async function markPaid(id){
+  const{error}=await db.from('payments').update({status:'received',received_date:localDate()}).eq('id',id);
+  if(error){toast('Error: '+error.message,'error');return;}
+  toast('Payment marked received!','success');go(CP);
+}
+async function markUnpaid(id){
+  const{error}=await db.from('payments').update({status:'pending',received_date:null}).eq('id',id);
+  if(error){toast('Error: '+error.message,'error');return;}
+  toast('Payment reset to pending.','success');go(CP);
+}
+
+async function deletePayment(id){
+  if(!confirm('Delete this payment row? This cannot be undone.'))return;
+  const{error}=await db.from('payments').delete().eq('id',id);
+  if(error){toast('Error: '+error.message,'error');return;}
+  toast('Payment deleted.','success');go(CP);
+}
+
+// DRAFTS
+async function renderDrafts(){
+  document.getElementById('pg-actions').innerHTML='<button class="btn btn-primary" onclick="openAddDraftAdmin()">+ New Draft</button>';
+  const{data:po}=await db.from('posts').select('*,clients(name)').order('created_at',{ascending:false});
+  const posts=po||[];
+  // Auto-clear comment_unread
+  const unread=posts.filter(p=>p.comment_unread).map(p=>p.id);
+  if(unread.length>0){await db.from('posts').update({comment_unread:false}).in('id',unread);refreshNotifBadge();}
+  if(!posts.length){document.getElementById('pg-content').innerHTML='<div class="empty-state"><p>No drafts yet.</p></div>';return;}
+  const months=[...new Set(posts.map(p=>p.month_year).filter(Boolean))];
+  const filterHtml=months.length>0?`<div style="margin-bottom:14px;display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span class="meta">Filter:</span><button class="toggle-btn active" id="filter-all" onclick="filterDrafts('all')">All</button>${months.map(m=>`<button class="toggle-btn" id="filter-${m.replace(/\s/g,'-')}" onclick="filterDrafts('${m}')">${m}</button>`).join('')}</div>`:'';
+  document.getElementById('pg-content').innerHTML=filterHtml+posts.map(p=>adminDraftCard(p)).join('');
+}
+
+function filterDrafts(month){
+  document.querySelectorAll('.toggle-btn').forEach(b=>b.classList.remove('active'));
+  const btn=document.getElementById(month==='all'?'filter-all':'filter-'+month.replace(/\s/g,'-'));
+  if(btn)btn.classList.add('active');
+  document.querySelectorAll('.draft-card').forEach(card=>{card.style.display=(month==='all'||card.dataset.month===month)?'block':'none';});
+}
+
+function adminDraftCard(p){
+  const hasEdit=p.client_edited&&p.client_content;
+  const isApproved=p.client_approved;
+  return`
+  <div class="draft-card ${hasEdit?'has-edit':''} ${isApproved?'client-approved':''}" data-month="${p.month_year||''}" data-id="${p.id}">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;gap:8px;flex-wrap:wrap">
+      <div>
+        <div class="draft-title">${p.title||'Untitled'}</div>
+        <div class="draft-meta">${p.clients?p.clients.name:'—'} ${p.proposed_date?'· Proposed: '+fmtDate(p.proposed_date):''} ${p.month_year?'· '+p.month_year:''}</div>
+      </div>
+      <div class="action-btns">
+        <button class="btn btn-outline btn-sm" onclick="openEditDraft('${p.id}')">Edit</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteDraft('${p.id}')">Delete</button>
+        ${p.status==='draft'?`<button class="btn btn-green btn-sm" onclick="updateDraftStatus('${p.id}','approved')">Approve</button>`:''}
+        ${p.status==='approved'?`<button class="btn btn-green btn-sm" onclick="updateDraftStatus('${p.id}','posted')">Mark Posted</button>`:''}
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      <span class="badge badge-${p.status}">${p.status}</span>
+      ${isApproved?'<span class="badge badge-client-approved">Client Approved</span>':''}
+      ${hasEdit?'<span class="badge badge-edited">Client Edited</span>':''}
+    </div>
+    ${isApproved?`<div class="approved-notice">Client approved this draft on ${fmtDateTime(p.approved_at)}</div>`:''}
+    ${hasEdit?`<div class="edit-notice">Client edited this draft on ${fmtDateTime(p.edited_at)}</div>
+    <div class="toggle-group">
+      <button class="toggle-btn active" id="tog-yours-${p.id}" onclick="toggleDiff('${p.id}','yours')">Your Version</button>
+      <button class="toggle-btn" id="tog-theirs-${p.id}" onclick="toggleDiff('${p.id}','theirs')">Client Version</button>
+    </div>
+    <div id="diff-yours-${p.id}" class="draft-content">${escHtml(p.original_content||p.content||'')}</div>
+    <div id="diff-theirs-${p.id}" class="draft-content" style="display:none;border-color:rgba(26,122,74,0.3)">${escHtml(p.client_content||'')}</div>`
+    :`<div class="draft-content">${escHtml(p.content||'')}</div>`}
+    ${p.admin_note?`<div class="admin-note-box"><div class="comment-label" style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gray);margin-bottom:4px">Private Note</div><div style="font-size:13px;color:var(--gray)">${escHtml(p.admin_note)}</div></div>`:''}
+    <div class="thread-wrap" id="thread-${p.id}"><div class="thread-header">Thread</div><div class="loading" style="padding:14px;font-size:12px"><span class="spinner"></span>Loading...</div></div>
+  </div>`;
+}
+
+// Load threads after render
+async function loadAllThreads(postIds){
+  for(const id of postIds){
+    await loadThread(id,'admin');
+  }
+}
+
+async function loadThread(postId, viewerRole){
+  const el=document.getElementById('thread-'+postId);
+  if(!el)return;
+  const{data:msgs}=await db.from('threads').select('*').eq('post_id',postId).order('created_at',{ascending:true});
+  const messages=msgs||[];
+  const isAdmin=viewerRole==='admin';
+  el.innerHTML=`
+    <div class="thread-header">Thread ${messages.length>0?'('+messages.length+')':''}</div>
+    <div class="thread-messages" id="tm-${postId}">
+      ${messages.length===0?'<div class="meta" style="text-align:center;padding:10px">No messages yet.</div>':messages.map(m=>{
+        const isYou=(isAdmin&&m.sender==='admin')||(!isAdmin&&m.sender==='client');
+        return`<div class="thread-msg ${isYou?'msg-you':'msg-client'}">
+          <div class="thread-msg-meta"><span class="${isYou?'sender-you':'sender-client'}">${isYou?'You':m.sender_name}</span> · ${fmtDateTime(m.created_at)}</div>
+          <div class="thread-msg-text">${escHtml(m.message)}</div>
+        </div>`;
+      }).join('')}
+    </div>
+    <div class="thread-reply">
+      <textarea id="tr-${postId}" placeholder="Write a message..." rows="1" onkeydown="handleThreadKey(event,'${postId}','${viewerRole}')"></textarea>
+      <button class="btn btn-primary btn-sm" onclick="sendThreadMsg('${postId}','${viewerRole}')">Send</button>
+    </div>
+  `;
+  // Scroll to bottom
+  const tm=document.getElementById('tm-'+postId);
+  if(tm)tm.scrollTop=tm.scrollHeight;
+}
+
+function handleThreadKey(e,postId,role){
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendThreadMsg(postId,role);}
+}
+
+async function sendThreadMsg(postId,role){
+  const el=document.getElementById('tr-'+postId);
+  const msg=(el.value||'').trim();
+  if(!msg)return;
+  el.value='';
+  const{error}=await db.from('threads').insert([{
+    post_id:postId,
+    sender:role,
+    sender_name:CU.name,
+    message:msg
+  }]);
+  if(error){toast('Error sending message.','error');return;}
+  // If client sent, mark comment_unread for admin
+  if(role==='client'){
+    await db.from('posts').update({comment_unread:true,comment_at:new Date().toISOString()}).eq('id',postId);
+  }
+  await loadThread(postId,role);
+}
+
+function toggleDiff(id,which){
+  document.getElementById(`diff-yours-${id}`).style.display=which==='yours'?'block':'none';
+  document.getElementById(`diff-theirs-${id}`).style.display=which==='theirs'?'block':'none';
+  document.getElementById(`tog-yours-${id}`).classList.toggle('active',which==='yours');
+  document.getElementById(`tog-theirs-${id}`).classList.toggle('active',which==='theirs');
+}
+
+// ADD CLIENT
+let acPaymentRows = [];
+
+function renderAddClient(){
+  acPaymentRows = [];
+  document.getElementById('pg-content').innerHTML=`
+  <div class="panel" style="max-width:680px">
+    <div class="panel-header"><div class="panel-title">New Client Engagement</div></div>
+    <div class="panel-body">
+      <div class="form-row"><div class="field"><label>Client Name *</label><input type="text" id="ac-name"/></div><div class="field"><label>Company</label><input type="text" id="ac-company"/></div></div>
+      <div class="form-row"><div class="field"><label>Email</label><input type="email" id="ac-email"/></div><div class="field"><label>Package Name</label><input type="text" id="ac-pkg"/></div></div>
+
+      <div class="form-row single" style="margin-bottom:14px">
+        <div class="field">
+          <label>Contract Type</label>
+          <div style="display:flex;gap:0;margin-top:4px">
+            <button type="button" id="ctype-retainer" class="toggle-btn active" onclick="setContractType('retainer')" style="flex:1">Retainer</button>
+            <button type="button" id="ctype-onetime" class="toggle-btn" onclick="setContractType('onetime')" style="flex:1">One-Time Project</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="ac-retainer-fields">
+        <div class="form-row"><div class="field"><label>Monthly Amount (&#8377;)</label><input type="number" id="ac-amt"/></div><div class="field"><label>Posts/Month</label><input type="number" id="ac-posts" value="10"/></div></div>
+        <div class="form-row"><div class="field"><label>Contract Start</label><input type="date" id="ac-start"/></div><div class="field"><label>Contract End</label><input type="date" id="ac-end"/></div></div>
+      </div>
+
+      <div id="ac-onetime-fields" style="display:none">
+        <div class="form-row"><div class="field"><label>Project Name</label><input type="text" id="ac-project" placeholder="e.g. Pitch Deck Design"/></div><div class="field"><label>Delivery Date</label><input type="date" id="ac-delivery"/></div></div>
+      </div>
+
+      <div class="form-row single"><div class="field"><label>Deliverables / Notes (admin only)</label><textarea id="ac-notes" placeholder="e.g. Pitch deck, 12 slides, 2 revision rounds."></textarea></div></div>
+
+      <div class="divider"></div>
+      <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:12px">Payment Schedule</div>
+      <div id="ac-payment-rows"></div>
+      <button type="button" class="btn btn-outline btn-sm" onclick="acAddPaymentRow()" style="margin-bottom:16px">+ Add Payment Row</button>
+
+      <div class="divider"></div>
+      <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:12px">Client Portal Login</div>
+      <div class="form-row"><div class="field"><label>Username *</label><input type="text" id="ac-user" placeholder="e.g. rajesh"/><div class="field-note">Client uses this to log in</div></div><div class="field"><label>Password *</label><input type="text" id="ac-pw" placeholder="e.g. name@2026"/></div></div>
+      <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="submitAddClient()">Add Client</button>
+        <button class="btn btn-outline" onclick="go('clients')">Cancel</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function setContractType(type){
+  document.getElementById('ctype-retainer').classList.toggle('active', type==='retainer');
+  document.getElementById('ctype-onetime').classList.toggle('active', type==='onetime');
+  document.getElementById('ac-retainer-fields').style.display = type==='retainer' ? '' : 'none';
+  document.getElementById('ac-onetime-fields').style.display = type==='onetime' ? '' : 'none';
+}
+
+function acAddPaymentRow(){
+  const id = Date.now();
+  acPaymentRows.push(id);
+  const container = document.getElementById('ac-payment-rows');
+  const row = document.createElement('div');
+  row.id = 'acpr-'+id;
+  row.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 2fr auto;gap:8px;margin-bottom:8px;align-items:end';
+  row.innerHTML = `
+    <div class="field"><label>Amount (&#8377;)</label><input type="number" id="acpamt-${id}" placeholder="13500"/></div>
+    <div class="field"><label>Due Date</label><input type="date" id="acpdue-${id}"/></div>
+    <div class="field"><label>Label</label><input type="text" id="acpnote-${id}" placeholder="e.g. Month 1 — April 2026"/></div>
+    <div><button type="button" class="btn btn-danger btn-sm" onclick="acRemovePaymentRow(${id})" style="margin-bottom:1px">Remove</button></div>
+  `;
+  container.appendChild(row);
+}
+
+function acRemovePaymentRow(id){
+  acPaymentRows = acPaymentRows.filter(r=>r!==id);
+  const el = document.getElementById('acpr-'+id);
+  if(el) el.remove();
+}
+
+async function submitAddClient(){
+  const name=document.getElementById('ac-name').value.trim();
+  const username=document.getElementById('ac-user').value.trim().toLowerCase();
+  const password=document.getElementById('ac-pw').value.trim();
+  if(!name){toast('Client name required.','error');return;}
+  if(!username||!password){toast('Username and password required.','error');return;}
+  const{data:ex}=await db.from('users').select('id').eq('username',username).limit(1);
+  if(ex&&ex.length>0){toast('Username already taken.','error');return;}
+
+  const isRetainer = document.getElementById('ctype-retainer').classList.contains('active');
+  const clientPayload = {
+    name,
+    company:document.getElementById('ac-company').value.trim(),
+    email:document.getElementById('ac-email').value.trim(),
+    username,
+    package_name: isRetainer ? document.getElementById('ac-pkg').value.trim() : (document.getElementById('ac-project').value.trim()||document.getElementById('ac-pkg').value.trim()),
+    package_amount: isRetainer ? (parseFloat(document.getElementById('ac-amt').value)||0) : 0,
+    posts_per_month: isRetainer ? (parseInt(document.getElementById('ac-posts').value)||10) : 0,
+    contract_start: isRetainer ? (document.getElementById('ac-start').value||null) : null,
+    contract_end: isRetainer ? (document.getElementById('ac-end').value||null) : (document.getElementById('ac-delivery').value||null),
+    notes: document.getElementById('ac-notes').value.trim(),
+    contract_type: isRetainer ? 'retainer' : 'onetime'
+  };
+
+  const{data:cd,error:ce}=await db.from('clients').insert([clientPayload]).select();
+  if(ce){toast('Error: '+ce.message,'error');return;}
+  const clientId = cd[0].id;
+
+  const{error:ue}=await db.from('users').insert([{username,password,name,role:'client',client_id:clientId}]);
+  if(ue){toast('Client created but login failed: '+ue.message,'error');return;}
+
+  // Insert payment rows
+  for(const rowId of acPaymentRows){
+    const amt = parseFloat(document.getElementById('acpamt-'+rowId)?.value);
+    const due = document.getElementById('acpdue-'+rowId)?.value||null;
+    const note = document.getElementById('acpnote-'+rowId)?.value.trim()||'';
+    if(amt){
+      await db.from('payments').insert([{client_id:clientId,amount:amt,due_date:due,notes:note,status:'pending'}]);
+    }
+  }
+
+  toast(name+' added!','success');go('clients');
+}
+
+// EDIT CLIENT
+async function openEditClient(id){
+  const{data:c}=await db.from('clients').select('*').eq('id',id).maybeSingle();
+  const{data:u}=await db.from('users').select('*').eq('client_id',id).maybeSingle();
+  if(!c)return;
+  modal(`
+    <div class="modal-header"><div class="modal-title">Edit — ${escHtml(c.name)}</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div class="form-row"><div class="field"><label>Name</label><input type="text" id="ec-name" value="${escAttr(c.name||'')}"/></div><div class="field"><label>Company</label><input type="text" id="ec-company" value="${escAttr(c.company||'')}"/></div></div>
+      <div class="form-row"><div class="field"><label>Email</label><input type="email" id="ec-email" value="${escAttr(c.email||'')}"/></div><div class="field"><label>Package Name</label><input type="text" id="ec-pkg" value="${escAttr(c.package_name||'')}"/></div></div>
+      <div class="form-row"><div class="field"><label>Amount (&#8377;/mo)</label><input type="number" id="ec-amt" value="${c.package_amount||''}"/></div><div class="field"><label>Posts/Month</label><input type="number" id="ec-posts" value="${c.posts_per_month||10}"/></div></div>
+      <div class="form-row"><div class="field"><label>Contract Start</label><input type="date" id="ec-start" value="${c.contract_start||''}"/></div><div class="field"><label>Contract End</label><input type="date" id="ec-end" value="${c.contract_end||''}"/></div></div>
+      <div class="form-row single"><div class="field"><label>Notes</label><textarea id="ec-notes">${escHtml(c.notes||'')}</textarea></div></div>
+      <div class="divider"></div>
+      <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:12px">Portal Login</div>
+      <div class="form-row"><div class="field"><label>Username</label><input type="text" id="ec-user" value="${escAttr(u?u.username:'')}"/></div><div class="field"><label>Password</label><input type="text" id="ec-pw" value="${escAttr(u?u.password:'')}"/></div></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitEditClient('${id}','${u?u.id:''}')">Save</button>
+    </div>
+  `);
+}
+
+async function submitEditClient(clientId,userId){
+  const{error:ce}=await db.from('clients').update({
+    name:document.getElementById('ec-name').value.trim(),
+    company:document.getElementById('ec-company').value.trim(),
+    email:document.getElementById('ec-email').value.trim(),
+    package_name:document.getElementById('ec-pkg').value.trim(),
+    package_amount:parseFloat(document.getElementById('ec-amt').value)||0,
+    posts_per_month:parseInt(document.getElementById('ec-posts').value)||10,
+    contract_start:document.getElementById('ec-start').value||null,
+    contract_end:document.getElementById('ec-end').value||null,
+    notes:document.getElementById('ec-notes').value.trim()
+  }).eq('id',clientId);
+  if(ce){toast('Error: '+ce.message,'error');return;}
+  const nu=document.getElementById('ec-user').value.trim().toLowerCase();
+  const np=document.getElementById('ec-pw').value.trim();
+  if(nu&&np){
+    if(userId)await db.from('users').update({username:nu,password:np}).eq('id',userId);
+    else{const{data:cd}=await db.from('clients').select('name').eq('id',clientId).maybeSingle();await db.from('users').insert([{username:nu,password:np,name:cd?cd.name:'Client',role:'client',client_id:clientId}]);}
+  }
+  closeModal();toast('Client updated!','success');go('clients');
+}
+
+// DELETE CLIENT
+async function confirmDeleteClient(clientId,clientName){
+  const{data:pm}=await db.from('payments').select('*').eq('client_id',clientId);
+  const{data:po}=await db.from('posts').select('id').eq('client_id',clientId);
+  const pendingPm=(pm||[]).filter(p=>p.status==='pending');
+  const receivedPm=(pm||[]).filter(p=>p.status==='received');
+  modal(`
+    <div class="modal-header"><div class="modal-title" style="color:var(--red)">Delete Client</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div class="warn-box">
+        <strong>This cannot be undone.</strong><br><br>
+        Deleting <strong style="color:var(--cream)">${escHtml(clientName)}</strong> will:<br><br>
+        &bull; Delete ${pendingPm.length} pending payment${pendingPm.length!==1?'s':''}<br>
+        &bull; Delete ${(po||[]).length} post draft${(po||[]).length!==1?'s':''}<br>
+        &bull; Keep ${receivedPm.length} received payment${receivedPm.length!==1?'s':''} — still counted in your total revenue
+      </div>
+      <div style="font-size:13px;color:var(--gray);margin-bottom:8px">Type the client name to confirm:</div>
+      <input type="text" id="del-confirm" style="width:100%;background:#0a0a0a;border:1px solid #2a2a2a;color:var(--cream);padding:10px 11px;font-family:'DM Sans',sans-serif;font-size:13px;outline:none" placeholder="${escAttr(clientName)}"/>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="executeDeleteClient('${clientId}','${escAttr(clientName)}')">Delete Client</button>
+    </div>
+  `);
+}
+
+async function executeDeleteClient(clientId,clientName){
+  const input=document.getElementById('del-confirm').value.trim();
+  if(input!==clientName){toast('Type the client name exactly.','error');return;}
+  await db.from('threads').delete().in('post_id',(await db.from('posts').select('id').eq('client_id',clientId)).data?.map(p=>p.id)||[]);
+  await db.from('payments').delete().eq('client_id',clientId).eq('status','pending');
+  await db.from('payments').update({client_id:null}).eq('client_id',clientId).eq('status','received');
+  await db.from('posts').delete().eq('client_id',clientId);
+  await db.from('users').delete().eq('client_id',clientId);
+  await db.from('clients').delete().eq('id',clientId);
+  closeModal();toast(clientName+' deleted. Revenue preserved.','success');go('clients');
+}
+
+// ADD PAYMENT
+function openAddPayment(clientId,clientName){
+  modal(`
+    <div class="modal-header"><div class="modal-title">Add Payment — ${escHtml(clientName)}</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div class="form-row"><div class="field"><label>Amount (&#8377;) *</label><input type="number" id="mp-amt"/></div><div class="field"><label>Due Date</label><input type="date" id="mp-due"/></div></div>
+      <div class="form-row single"><div class="field"><label>Notes</label><input type="text" id="mp-notes" placeholder="e.g. Month 1 advance"/></div></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitAddPayment('${clientId}')">Add Payment</button>
+    </div>
+  `);
+}
+async function submitAddPayment(clientId){
+  const amount=parseFloat(document.getElementById('mp-amt').value);
+  if(!amount){toast('Amount required.','error');return;}
+  const{error}=await db.from('payments').insert([{client_id:clientId,amount,due_date:document.getElementById('mp-due').value||null,notes:document.getElementById('mp-notes').value.trim(),status:'pending'}]);
+  if(error){toast('Error: '+error.message,'error');return;}
+  closeModal();toast('Payment added!','success');go('clients');
+}
+
+// DRAFTS ADD/EDIT
+function openAddDraft(clientId,clientName){
+  modal(`
+    <div class="modal-header"><div class="modal-title">New Draft — ${escHtml(clientName)}</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div class="form-row"><div class="field"><label>Post Title</label><input type="text" id="pd-title"/></div><div class="field"><label>Proposed Post Date</label><input type="date" id="pd-proposed"/></div></div>
+      <div class="form-row"><div class="field"><label>Month / Year</label><input type="text" id="pd-month" placeholder="e.g. April 2026"/></div><div class="field"><label>Status</label><select id="pd-status"><option value="draft">Draft (only you)</option><option value="approved">Approved (client sees)</option></select></div></div>
+      <div class="form-row single"><div class="field"><label>Content *</label><textarea id="pd-content" style="min-height:160px"></textarea></div></div>
+      <div class="form-row single"><div class="field"><label>Private Note (admin only)</label><textarea id="pd-admin-note" style="min-height:56px" placeholder="Notes only you see..."></textarea></div></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitAddDraft('${clientId}')">Save Draft</button>
+    </div>
+  `);
+}
+
+async function openAddDraftAdmin(){
+  const{data:clients}=await db.from('clients').select('id,name');
+  modal(`
+    <div class="modal-header"><div class="modal-title">New Draft</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div class="form-row single"><div class="field"><label>Client *</label><select id="pd-client"><option value="">Select client...</option>${(clients||[]).map(c=>`<option value="${c.id}">${c.name}</option>`).join('')}</select></div></div>
+      <div class="form-row"><div class="field"><label>Post Title</label><input type="text" id="pd-title"/></div><div class="field"><label>Proposed Post Date</label><input type="date" id="pd-proposed"/></div></div>
+      <div class="form-row"><div class="field"><label>Month / Year</label><input type="text" id="pd-month" placeholder="e.g. April 2026"/></div><div class="field"><label>Status</label><select id="pd-status"><option value="draft">Draft</option><option value="approved">Approved</option><option value="posted">Posted</option></select></div></div>
+      <div class="form-row single"><div class="field"><label>Content *</label><textarea id="pd-content" style="min-height:160px"></textarea></div></div>
+      <div class="form-row single"><div class="field"><label>Private Note (admin only)</label><textarea id="pd-admin-note" style="min-height:56px"></textarea></div></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitAddDraft(document.getElementById('pd-client').value)">Save Draft</button>
+    </div>
+  `);
+}
+
+async function submitAddDraft(clientId){
+  if(!clientId){toast('Select a client.','error');return;}
+  const content=(document.getElementById('pd-content').value||'').trim();
+  if(!content){toast('Content required.','error');return;}
+  const{error}=await db.from('posts').insert([{
+    client_id:clientId,title:(document.getElementById('pd-title').value||'').trim(),
+    content,original_content:content,
+    proposed_date:document.getElementById('pd-proposed').value||null,
+    month_year:(document.getElementById('pd-month').value||'').trim(),
+    status:document.getElementById('pd-status').value,
+    admin_note:(document.getElementById('pd-admin-note').value||'').trim(),
+    client_edited:false,comment_unread:false,client_approved:false
+  }]);
+  if(error){toast('Error: '+error.message,'error');return;}
+  closeModal();toast('Draft saved!','success');go('drafts');
+}
+
+async function openEditDraft(id){
+  const{data:p}=await db.from('posts').select('*').eq('id',id).maybeSingle();
+  if(!p)return;
+  modal(`
+    <div class="modal-header"><div class="modal-title">Edit Draft</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div class="form-row"><div class="field"><label>Title</label><input type="text" id="ed-title" value="${escAttr(p.title||'')}"/></div><div class="field"><label>Proposed Date</label><input type="date" id="ed-proposed" value="${p.proposed_date||''}"/></div></div>
+      <div class="form-row"><div class="field"><label>Month / Year</label><input type="text" id="ed-month" value="${escAttr(p.month_year||'')}"/></div><div class="field"><label>Status</label><select id="ed-status"><option value="draft" ${p.status==='draft'?'selected':''}>Draft</option><option value="approved" ${p.status==='approved'?'selected':''}>Approved</option><option value="posted" ${p.status==='posted'?'selected':''}>Posted Live</option></select></div></div>
+      <div class="form-row single"><div class="field"><label>Your Content</label><textarea id="ed-content" style="min-height:160px">${escHtml(p.original_content||p.content||'')}</textarea></div></div>
+      ${p.client_edited&&p.client_content?`<div class="form-row single"><div class="field"><label style="color:var(--green-light)">Client Version (read only)</label><div class="draft-content" style="border-color:rgba(26,122,74,0.3)">${escHtml(p.client_content)}</div></div></div>`:''}
+      <div class="form-row single"><div class="field"><label>Private Note</label><textarea id="ed-admin-note" style="min-height:56px">${escHtml(p.admin_note||'')}</textarea></div></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-danger btn-sm" onclick="deleteDraft('${id}')">Delete</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitEditDraft('${id}')">Save</button>
+    </div>
+  `);
+}
+
+async function submitEditDraft(id){
+  const content=document.getElementById('ed-content').value.trim();
+  const{error}=await db.from('posts').update({
+    title:document.getElementById('ed-title').value.trim(),content,original_content:content,
+    proposed_date:document.getElementById('ed-proposed').value||null,
+    month_year:document.getElementById('ed-month').value.trim(),
+    status:document.getElementById('ed-status').value,
+    admin_note:document.getElementById('ed-admin-note').value.trim()
+  }).eq('id',id);
+  if(error){toast('Error: '+error.message,'error');return;}
+  closeModal();toast('Draft updated!','success');go('drafts');
+}
+
+async function updateDraftStatus(id,status){
+  const extra=status==='posted'?{posted_date:localDate()}:{};
+  await db.from('posts').update({status,...extra}).eq('id',id);
+  toast('Marked as '+status+'!','success');go('drafts');
+}
+
+async function deleteDraft(id){
+  if(!confirm('Delete this draft?'))return;
+  await db.from('threads').delete().eq('post_id',id);
+  await db.from('posts').delete().eq('id',id);
+  closeModal();toast('Draft deleted.','success');go('drafts');
+}
+
+// CLIENT PORTAL
+async function getMyClient(){
+  if(!CU.clientId)return null;
+  const{data}=await db.from('clients').select('*').eq('id',CU.clientId).limit(1);
+  return(data&&data.length>0)?data[0]:null;
+}
+
+async function renderClientHome(){
+  const client=await getMyClient();
+  if(!client){document.getElementById('pg-content').innerHTML='<div class="portal-hero"><div class="portal-greeting">Welcome, '+CU.name+'.</div><div class="portal-sub">Your portal is being set up.</div></div>';return;}
+  const{data:pm}=await db.from('payments').select('*').eq('client_id',client.id).order('due_date');
+  const{data:po}=await db.from('posts').select('*').eq('client_id',client.id).in('status',['approved','posted']).order('created_at',{ascending:false});
+  const payments=pm||[],posts=po||[];
+  const pending=payments.filter(p=>p.status==='pending');
+  const next=pending.sort((a,b)=>new Date(a.due_date)-new Date(b.due_date))[0];
+  const now=new Date();
+  const end=client.contract_end?new Date(client.contract_end):now;
+  const daysLeft=Math.max(0,Math.ceil((end-now)/86400000));
+  const start=client.contract_start?new Date(client.contract_start):now;
+  const totalMonths=Math.ceil((end-start)/86400000/30);
+  const elapsedMonths=Math.ceil((now-start)/86400000/30);
+
+  // Contract progress months
+  const monthsHtml=Array.from({length:totalMonths}).map((_,i)=>{
+    const isDone=i<elapsedMonths-1;
+    const isCurrent=i===elapsedMonths-1;
+    const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const d=new Date(start);d.setMonth(d.getMonth()+i);
+    const label=months[d.getMonth()];
+    return`<div class="progress-month ${isDone?'done':isCurrent?'current':''}">${label}<br><span style="font-size:9px">${isDone?'Done':isCurrent?'Now':'—'}</span></div>`;
+  }).join('');
+
+  document.getElementById('pg-content').innerHTML=`
+    <div class="portal-hero">
+      <div class="portal-greeting">Welcome back, ${escHtml(client.name)}.</div>
+      <div class="portal-sub">${escHtml(client.package_name||'LinkedIn Content Partnership')} · Boldface</div>
+    </div>
+    <div class="contract-progress">
+      <div class="stat-label">Contract Progress</div>
+      <div class="progress-months">${monthsHtml}</div>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">Monthly Package</div><div class="stat-value" style="font-size:24px">&#8377;${Number(client.package_amount||0).toLocaleString()}</div><div class="stat-meta">${client.package_name||''}</div></div>
+      <div class="stat-card"><div class="stat-label">Next Payment</div><div class="stat-value" style="font-size:20px">${next?'&#8377;'+Number(next.amount||0).toLocaleString():'—'}</div><div class="stat-meta">${next?fmtDate(next.due_date):'No pending payments'}</div></div>
+      <div class="stat-card"><div class="stat-label">Posts Available</div><div class="stat-value">${posts.length}</div><div class="stat-meta">Drafts from Boldface</div></div>
+      <div class="stat-card"><div class="stat-label">Days Left</div><div class="stat-value">${daysLeft}</div><div class="stat-meta">Contract ends ${fmtDate(client.contract_end)}</div></div>
+    </div>
+    ${posts.length>0?`<div class="panel"><div class="panel-header"><div class="panel-title">Latest from Boldface</div><button class="btn btn-outline btn-sm" onclick="go('client-drafts')">View All</button></div><div class="panel-body">${posts.slice(0,2).map(p=>`<div class="draft-card" style="margin-bottom:10px"><div class="draft-title">${escHtml(p.title||'LinkedIn Post')}</div><div class="draft-meta">${p.proposed_date?'Proposed: '+fmtDate(p.proposed_date):''}</div><div class="draft-content" style="margin-top:8px;max-height:70px;overflow:hidden">${escHtml((p.client_content||p.content||'').substring(0,180))}...</div></div>`).join('')}</div></div>`:''}
+  `;
+}
+
+async function renderClientPayments(){
+  const client=await getMyClient();
+  if(!client){document.getElementById('pg-content').innerHTML='<div class="empty-state"><p>No data found.</p></div>';return;}
+  const{data:pm}=await db.from('payments').select('*').eq('client_id',client.id).order('due_date');
+  const payments=pm||[];
+  const received=payments.filter(p=>p.status==='received');
+  const pending=payments.filter(p=>p.status==='pending');
+  document.getElementById('pg-content').innerHTML=`
+    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat-card"><div class="stat-label">Monthly Fee</div><div class="stat-value" style="font-size:24px">&#8377;${Number(client.package_amount||0).toLocaleString()}</div><div class="stat-meta">per month</div></div>
+      <div class="stat-card"><div class="stat-label">Paid So Far</div><div class="stat-value" style="font-size:24px">&#8377;${Number(received.reduce((s,p)=>s+(p.amount||0),0)).toLocaleString()}</div><div class="stat-meta">${received.length} payment${received.length!==1?'s':''}</div></div>
+      <div class="stat-card"><div class="stat-label">Pending</div><div class="stat-value" style="font-size:24px;color:var(--gold)">&#8377;${Number(pending.reduce((s,p)=>s+(p.amount||0),0)).toLocaleString()}</div><div class="stat-meta">${pending.length} due</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title">Payment Schedule</div></div>
+      <div class="panel-body" style="padding:0;overflow-x:auto">
+        ${payments.length===0?'<div class="empty-state"><p>No payment records yet.</p></div>':`
+        <table class="data-table"><thead><tr><th>Amount</th><th>Due Date</th><th>Paid On</th><th>Status</th></tr></thead>
+        <tbody>${payments.map(p=>`<tr><td class="gold">&#8377;${Number(p.amount||0).toLocaleString()}</td><td>${fmtDate(p.due_date)}</td><td>${p.received_date?fmtDate(p.received_date):'—'}</td><td><span class="badge badge-${p.status==='received'?'paid':'pending'}">${p.status==='received'?'Paid':'Pending'}</span></td></tr>`).join('')}</tbody>
+        </table>`}
+      </div>
+    </div>
+  `;
+}
+
+async function renderClientDrafts(){
+  const client=await getMyClient();
+  if(!client){document.getElementById('pg-content').innerHTML='<div class="empty-state"><p>No data found.</p></div>';return;}
+  const{data:po}=await db.from('posts').select('*').eq('client_id',client.id).in('status',['approved','posted']).order('created_at',{ascending:false});
+  const posts=po||[];
+  if(!posts.length){document.getElementById('pg-content').innerHTML='<div class="empty-state"><p>No drafts yet. Boldface is working on it.</p></div>';return;}
+  document.getElementById('pg-content').innerHTML=posts.map(p=>`
+  <div class="draft-card ${p.client_approved?'client-approved':''}">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;gap:8px;flex-wrap:wrap">
+      <div>
+        <div class="draft-title">${escHtml(p.title||'LinkedIn Post')}</div>
+        <div class="draft-meta">${p.proposed_date?'Proposed: '+fmtDate(p.proposed_date):''} ${p.month_year?'· '+p.month_year:''}</div>
+      </div>
+      <div class="action-btns">
+        <span class="badge badge-${p.status}">${p.status}</span>
+        ${p.client_approved?'<span class="badge badge-client-approved">Approved by you</span>':''}
+      </div>
+    </div>
+    <div class="draft-content" style="white-space:pre-wrap">${escHtml(p.client_content||p.content||'')}</div>
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+      <button class="btn btn-outline btn-sm" onclick="openClientEdit('${p.id}')">Edit Draft</button>
+      ${p.client_approved ? '<button class="btn btn-green btn-sm" disabled style="opacity:0.6">Approved</button>' : `<button class="btn btn-green btn-sm" onclick="setClientApproval(\'${p.id}\')">Approve to Post</button>`}
+
+
+      }
+    </div>
+    <div class="thread-wrap" id="thread-${p.id}"><div class="thread-header">Thread with Boldface</div><div class="loading" style="padding:14px;font-size:12px"><span class="spinner"></span>Loading...</div></div>
+  </div>`).join('');
+  // Load threads
+  for(const p of posts)await loadThread(p.id,'client');
+}
+
+async function setClientApproval(postId,approve){
+  const{error}=await db.from('posts').update({
+    client_approved:true,
+    approved_at:new Date().toISOString()
+  }).eq('id',postId);
+  if(error){toast('Error.','error');return;}
+  toast('Draft approved!','success');
+  go('client-drafts');
+}
+
+async function openClientEdit(postId){
+  const{data:p}=await db.from('posts').select('*').eq('id',postId).maybeSingle();
+  if(!p)return;
+  modal(`
+    <div class="modal-header"><div class="modal-title">Edit Draft</div><button class="modal-close" onclick="closeModal()">&#215;</button></div>
+    <div class="modal-body">
+      <div style="margin-bottom:12px;font-size:13px;color:var(--gray)">Your edits are saved alongside the original. Boldface will see both versions.</div>
+      <div class="form-row single"><div class="field"><label>Your Edit</label><textarea id="ce-content" style="min-height:200px">${escHtml(p.client_content||p.content||'')}</textarea></div></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitClientEdit('${postId}')">Save My Edit</button>
+    </div>
+  `);
+}
+
+async function submitClientEdit(postId){
+  const content=(document.getElementById('ce-content').value||'').trim();
+  if(!content){toast('Content cannot be empty.','error');return;}
+  const{error}=await db.from('posts').update({client_content:content,client_edited:true,edited_at:new Date().toISOString()}).eq('id',postId);
+  if(error){toast('Error saving edit.','error');return;}
+  closeModal();toast('Your edit has been saved!','success');go('client-drafts');
+}
+
+// UTILS
+function modal(html){document.getElementById('modals').innerHTML=`<div class="modal-overlay active" id="mo" onclick="handleMO(event)"><div class="modal">${html}</div></div>`;}
+function handleMO(e){if(e.target.id==='mo')closeModal();}
+function closeModal(){document.getElementById('modals').innerHTML='';}
+
+function toast(msg,type='default'){
+  const c=document.getElementById('toasts');
+  const el=document.createElement('div');
+  el.className=`toast ${type}`;el.textContent=msg;
+  c.appendChild(el);setTimeout(()=>el.remove(),3500);
+}
+
+function fmtDate(d){if(!d)return'—';return new Date(d).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});}
+function fmtDateTime(d){if(!d)return'—';return new Date(d).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});}
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function escAttr(s){return String(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+// =====================
+// MOBILE NAV
+// =====================
+function buildMobileNav() {
+  const nav = document.getElementById('mobile-nav');
+  if(!nav) return;
+  if(CU.role === 'admin') {
+    nav.innerHTML = `
+      <div class="mob-nav-item" id="mn-dashboard" onclick="go('dashboard')">Home</div>
+      <div class="mob-nav-item" id="mn-clients" onclick="go('clients')">Clients</div>
+      <div class="mob-nav-item" id="mn-drafts" onclick="go('drafts')">Drafts<span class="mob-nav-badge" id="mob-notif" style="display:none"></span></div>
+      <div class="mob-nav-item" id="mn-payments" onclick="go('payments')">Money</div>
+      <div class="mob-nav-item" onclick="doLogout()" style="color:var(--red)">Sign Out</div>
+    `;
+  } else {
+    nav.innerHTML = `
+      <div class="mob-nav-item" id="mn-client-home" onclick="go('client-home')">Home</div>
+      <div class="mob-nav-item" id="mn-client-payments" onclick="go('client-payments')">Payments</div>
+      <div class="mob-nav-item" id="mn-client-drafts" onclick="go('client-drafts')">Drafts</div>
+      <div class="mob-nav-item" onclick="doLogout()" style="color:var(--red)">Sign Out</div>
+    `;
+  }
+}
+
+function setMobileNav(page) {
+  document.querySelectorAll('.mob-nav-item').forEach(el => el.classList.remove('active'));
+  const el = document.getElementById('mn-' + page);
+  if(el) el.classList.add('active');
+}
+
+// =====================
+// THREAD (COMMENTS)
+// =====================
+async function loadThread(postId) {
+  const { data } = await db.from('threads').select('*').eq('post_id', postId).order('created_at', {ascending:true});
+  return data || [];
+}
+
+function renderThread(messages, postId, isAdmin) {
+  const isEmpty = messages.length === 0;
+  const msgsHtml = isEmpty ? '<div class="thread-empty">No messages yet. Start the conversation.</div>' :
+    messages.map(m => {
+      const fromAdmin = m.sender === 'admin';
+      const cls = fromAdmin ? 'from-admin' : 'from-client';
+      const who = fromAdmin ? 'Koushik' : m.sender_name || 'Client';
+      return `<div class="thread-msg ${cls}">
+        <div class="thread-who">${who}</div>
+        <div class="thread-bubble">${escHtml(m.message)}</div>
+        <div class="thread-time">${fmtDateTime(m.created_at)}</div>
+      </div>`;
+    }).join('');
+
+  return `
+    <div style="margin-top:14px">
+      <div class="section-label">Conversation</div>
+      <div class="thread-container" id="thread-${postId}">${msgsHtml}</div>
+      <div class="thread-input-row">
+        <textarea id="thread-input-${postId}" placeholder="Type a message..." rows="1"></textarea>
+        <button class="btn btn-primary btn-sm" onclick="sendThreadMessage('${postId}','${isAdmin?'admin':'client'}')">Send</button>
+      </div>
+    </div>`;
+}
+
+async function sendThreadMessage(postId, senderRole) {
+  const input = document.getElementById('thread-input-' + postId);
+  const message = (input ? input.value : '').trim();
+  if(!message) return;
+
+  const senderName = CU.name;
+  const { error } = await db.from('threads').insert([{
+    post_id: postId,
+    sender: senderRole,
+    sender_name: senderName,
+    message
+  }]);
+
+  if(error) { toast('Error sending message.', 'error'); return; }
+
+  // Mark unread for the other side
+  if(senderRole === 'client') {
+    await db.from('posts').update({ comment_unread: true, comment_at: new Date().toISOString() }).eq('id', postId);
+  } else {
+    await db.from('posts').update({ admin_replied: true }).eq('id', postId);
+  }
+
+  if(input) input.value = '';
+  // Reload thread messages
+  const messages = await loadThread(postId);
+  const container = document.getElementById('thread-' + postId);
+  if(container) {
+    container.innerHTML = messages.map(m => {
+      const fromAdmin = m.sender === 'admin';
+      const cls = fromAdmin ? 'from-admin' : 'from-client';
+      const who = fromAdmin ? 'Koushik' : m.sender_name || 'Client';
+      return `<div class="thread-msg ${cls}">
+        <div class="thread-who">${who}</div>
+        <div class="thread-bubble">${escHtml(m.message)}</div>
+        <div class="thread-time">${fmtDateTime(m.created_at)}</div>
+      </div>`;
+    }).join('');
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+// =====================
+// APPROVAL (CLIENT)
+// =====================
+async function approvePost(postId) {
+  const { error } = await db.from('posts').update({
+    client_approved: true,
+    approved_at: new Date().toISOString()
+  }).eq('id', postId);
+  if(error) { toast('Error.', 'error'); return; }
+  toast('Draft approved!', 'success');
+  go('client-drafts');
+}
+
+// =====================
+// SEARCH (ADMIN)
+// =====================
+async function renderSearch() {
+  document.getElementById('pg-content').innerHTML = `
+    <input type="text" class="search-bar" id="search-input" placeholder="Search clients, drafts, payments..." oninput="doSearch()" autofocus/>
+    <div id="search-results"></div>
+  `;
+}
+
+async function doSearch() {
+  const q = (document.getElementById('search-input').value || '').trim().toLowerCase();
+  const results = document.getElementById('search-results');
+  if(!q || q.length < 2) { results.innerHTML = '<div class="meta" style="text-align:center;padding:20px">Type to search...</div>'; return; }
+
+  const [{ data: cl }, { data: po }, { data: pm }] = await Promise.all([
+    db.from('clients').select('*'),
+    db.from('posts').select('*, clients(name)'),
+    db.from('payments').select('*, clients(name)')
+  ]);
+
+  const clients = (cl||[]).filter(c =>
+    (c.name||'').toLowerCase().includes(q) ||
+    (c.company||'').toLowerCase().includes(q) ||
+    (c.email||'').toLowerCase().includes(q)
+  );
+
+  const posts = (po||[]).filter(p =>
+    (p.title||'').toLowerCase().includes(q) ||
+    (p.content||'').toLowerCase().includes(q) ||
+    (p.month_year||'').toLowerCase().includes(q)
+  );
+
+  const payments = (pm||[]).filter(p =>
+    (p.notes||'').toLowerCase().includes(q) ||
+    (p.clients&&(p.clients.name||'').toLowerCase().includes(q))
+  );
+
+  if(!clients.length && !posts.length && !payments.length) {
+    results.innerHTML = '<div class="meta" style="text-align:center;padding:20px">No results found.</div>';
+    return;
+  }
+
+  let html = '';
+
+  if(clients.length) {
+    html += clients.map(c => `
+      <div class="search-result" onclick="go('clients')">
+        <div class="search-result-type">Client</div>
+        <div class="search-result-title">${c.name}</div>
+        <div class="search-result-sub">${c.company||''} ${c.package_name?'· '+c.package_name:''}</div>
+      </div>`).join('');
+  }
+
+  if(posts.length) {
+    html += posts.map(p => `
+      <div class="search-result" onclick="go('drafts')">
+        <div class="search-result-type">Draft · ${p.clients?p.clients.name:'—'}</div>
+        <div class="search-result-title">${p.title||'Untitled'}</div>
+        <div class="search-result-sub">${(p.content||'').substring(0,80)}...</div>
+      </div>`).join('');
+  }
+
+  if(payments.length) {
+    html += payments.map(p => `
+      <div class="search-result" onclick="go('payments')">
+        <div class="search-result-type">Payment · ${p.clients?p.clients.name:'—'}</div>
+        <div class="search-result-title">&#8377;${Number(p.amount||0).toLocaleString()} · ${fmtDate(p.due_date)}</div>
+        <div class="search-result-sub">${p.notes||''} · ${p.status}</div>
+      </div>`).join('');
+  }
+
+  results.innerHTML = html;
+}
+
+// =====================
+// CASHFLOW (ADMIN)
+// =====================
+async function renderCashflow() {
+  const { data: pm } = await db.from('payments').select('*, clients(name)').order('due_date');
+  const payments = pm || [];
+
+  // Group by month
+  const months = {};
+  payments.forEach(p => {
+    if(!p.due_date) return;
+    const d = new Date(p.due_date);
+    const key = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+    const label = d.toLocaleDateString('en-IN', {month:'long', year:'numeric'});
+    if(!months[key]) months[key] = { label, received: [], pending: [], key };
+    if(p.status === 'received') months[key].received.push(p);
+    else months[key].pending.push(p);
+  });
+
+  const sortedKeys = Object.keys(months).sort();
+  const totalExpected = payments.reduce((s,p)=>s+(p.amount||0),0);
+
+  document.getElementById('pg-title').textContent = 'Cashflow';
+  document.getElementById('pg-sub').textContent = 'Month-wise breakdown of income';
+
+  document.getElementById('pg-content').innerHTML = `
+    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">
+      <div class="stat-card">
+        <div class="stat-label">Total Expected</div>
+        <div class="stat-value">&#8377;${Math.round(totalExpected/1000)}k</div>
+        <div class="stat-meta">Across all months</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Received So Far</div>
+        <div class="stat-value">&#8377;${Math.round(payments.filter(p=>p.status==='received').reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div>
+        <div class="stat-meta">${payments.filter(p=>p.status==='received').length} payments</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Still Incoming</div>
+        <div class="stat-value">&#8377;${Math.round(payments.filter(p=>p.status==='pending').reduce((s,p)=>s+(p.amount||0),0)/1000)}k</div>
+        <div class="stat-meta">${payments.filter(p=>p.status==='pending').length} pending</div>
+      </div>
+    </div>
+    ${sortedKeys.map(k => {
+      const m = months[k];
+      const receivedTotal = m.received.reduce((s,p)=>s+(p.amount||0),0);
+      const pendingTotal = m.pending.reduce((s,p)=>s+(p.amount||0),0);
+      const monthTotal = receivedTotal + pendingTotal;
+      const pct = monthTotal > 0 ? Math.round((receivedTotal/monthTotal)*100) : 0;
+      const isPast = new Date(k+'-28') < new Date();
+      return `
+      <div class="cashflow-month">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div class="cashflow-month-title">${m.label}</div>
+          <div style="font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--gold)">&#8377;${Number(monthTotal).toLocaleString()}</div>
+        </div>
+        <div class="cashflow-bar"><div class="cashflow-bar-fill" style="width:${pct}%"></div></div>
+        <div style="display:flex;justify-content:space-between;margin-top:8px">
+          <div class="meta" style="color:var(--green-light)">&#10003; &#8377;${Number(receivedTotal).toLocaleString()} received</div>
+          <div class="meta" style="${pendingTotal>0?'color:var(--gold)':'color:var(--gray)'}">&#8377;${Number(pendingTotal).toLocaleString()} ${isPast&&pendingTotal>0?'overdue':'expected'}</div>
+        </div>
+        ${m.received.length+m.pending.length > 0 ? `
+        <div style="margin-top:10px;border-top:1px solid #1a1a1a;padding-top:10px">
+          ${[...m.received,...m.pending].map(p=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #141414">
+            <div style="font-size:13px">${p.clients?p.clients.name:'Past client'} <span class="meta">· ${p.notes||''}</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:13px">&#8377;${Number(p.amount||0).toLocaleString()}</span>
+              <span class="badge badge-${p.status==='received'?'paid':'pending'}">${p.status}</span>
+              ${p.status==='pending'?`<button class="btn btn-primary btn-sm" onclick="markPaid('${p.id}')">Mark Received</button>`:''}
+            </div>
+          </div>`).join('')}
+        </div>` : ''}
+      </div>`;
+    }).join('')}
+  `;
+}
+
+// =====================
+// CONTRACT RENEWAL ALERTS
+// =====================
+function checkRenewals(clients) {
+  const now = new Date();
+  const in30 = new Date(now.getTime() + 30 * 86400000);
+  return (clients||[]).filter(c => {
+    if(!c.contract_end) return false;
+    const end = new Date(c.contract_end);
+    return end >= now && end <= in30;
+  });
+}
+
+</script>
+</body>
+</html>
